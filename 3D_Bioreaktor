@@ -1,0 +1,265 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================
+# Grid
+# =========================
+nx, ny, nz = 20, 20, 20
+
+def create_reactor_mask(nx, ny, nz):
+    mask = np.zeros((nx, ny, nz))
+
+    cx, cy = nx//2, ny//2
+    R = nx//2 - 2
+
+    for i in range(nx):
+        for j in range(ny):
+            if (i-cx)**2 + (j-cy)**2 < R**2:
+                mask[i,j,:] = 1
+
+    return mask
+
+mask = create_reactor_mask(nx, ny, nz)
+
+
+dx = dy = dz = 1.0 / nx
+dt = 0.0002
+nt = 200
+
+rho = 1000.0
+mu = 0.01
+
+# =========================
+# Felder
+# =========================
+u = np.zeros((nx, ny, nz))
+v = np.zeros((nx, ny, nz))
+w = np.zeros((nx, ny, nz))
+p = np.zeros((nx, ny, nz))
+
+# =========================
+# Ableitungen
+# =========================
+def ddx(f):
+    return (np.roll(f,-1,0) - np.roll(f,1,0)) / (2*dx)
+
+def ddy(f):
+    return (np.roll(f,-1,1) - np.roll(f,1,1)) / (2*dy)
+
+def ddz(f):
+    return (np.roll(f,-1,2) - np.roll(f,1,2)) / (2*dz)
+
+def laplace(f):
+    return (
+        (np.roll(f,-1,0)-2*f+np.roll(f,1,0))/dx**2 +
+        (np.roll(f,-1,1)-2*f+np.roll(f,1,1))/dy**2 +
+        (np.roll(f,-1,2)-2*f+np.roll(f,1,2))/dz**2
+    )
+
+def divergence(u,v,w):
+    return ddx(u) + ddy(v) + ddz(w)
+
+# =========================
+# Druck
+# =========================
+def pressure_poisson(p, u_star, v_star, w_star):
+    b = rho * divergence(u_star, v_star, w_star) / dt
+
+    for _ in range(400):
+        p_new = (
+            np.roll(p,1,0) + np.roll(p,-1,0) +
+            np.roll(p,1,1) + np.roll(p,-1,1) +
+            np.roll(p,1,2) + np.roll(p,-1,2)
+        ) / 6 - dx**2 * b / 6
+
+        p_new[0,:,:]  = p_new[1,:,:]
+        p_new[-1,:,:] = p_new[-2,:,:]
+
+        p_new[:,0,:]  = p_new[:,1,:]
+        p_new[:,-1,:] = p_new[:,-2,:]
+
+        p_new[:,:,0]  = p_new[:,:,1]
+        p_new[:,:,-1] = p_new[:,:,-2]
+        # Konvergenzcheck
+        if np.max(np.abs(p_new - p)) < 1e-4:
+            break
+
+        p = p_new
+
+    return p
+
+
+# =========================
+# Impeller (rotierende Scheibe)
+# =========================
+def impeller_force():
+    Fx = np.zeros_like(u)
+    Fy = np.zeros_like(v)
+    Fz = np.zeros_like(w)
+
+    cx, cy, cz = nx//2, ny//2, nz//2
+    radius = 6
+
+    strength = 80 # Rührerdrehzahl
+
+
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                dx_ = i - cx
+                dy_ = j - cy
+                r2 = dx_**2 + dy_**2 
+                r = np.sqrt(dx_**2 + dy_**2) + 1e-6
+
+                if r2 < radius**2 and abs(k-cz) < 5:
+                    Fx[i,j,k] = -dy_/r * strength
+                    Fy[i,j,k] =  dx_/r * strength
+                    Fz[i,j,k] = 50 * (k - cz) / nz
+
+    return Fx, Fy, Fz
+# =========================
+# Baffles
+# =========================
+def add_baffles(mask):
+    cx, cy = nx//2, ny//2
+    width = 2
+    length = nx//3
+
+    # 4 Baffles
+    mask[cx+length:cx+length+width, cy-1:cy+1, :] = 0
+    mask[cx-length:cx-length+width, cy-1:cy+1, :] = 0
+    mask[cx-1:cx+1, cy+length:cy+length+width, :] = 0
+    mask[cx-1:cx+1, cy-length:cy-length+width, :] = 0
+
+    return mask
+
+mask = add_baffles(mask)
+# =========================
+# Randbedingungen
+# =========================
+def apply_bc(u,v,w):
+
+    u *= mask
+    v *= mask
+    w *= mask
+    u[0,:,:]=u[-1,:,:]=0
+    u[:,0,:]=u[:,-1,:]=0
+    u[:,:,0]=u[:,:,-1]=0
+
+    v[0,:,:]=v[-1,:,:]=0
+    v[:,0,:]=v[:,-1,:]=0
+    v[:,:,0]=v[:,:,-1]=0
+
+    w[0,:,:]=w[-1,:,:]=0
+    w[:,0,:]=w[:,-1,:]=0
+    w[:,:,0]=w[:,:,-1]=0
+
+    return u,v,w
+
+# =========================
+# Simulation
+# =========================
+for t in range(nt):
+
+    Fx, Fy, Fz = impeller_force()
+
+    # --- Navier-Stokes (ohne Druck) ---
+    conv_u = u*ddx(u) + v*ddy(u) + w*ddz(u)
+    conv_v = u*ddx(v) + v*ddy(v) + w*ddz(v)
+    conv_w = u*ddx(w) + v*ddy(w) + w*ddz(w)
+
+    visc_u = mu * laplace(u)
+    visc_v = mu * laplace(v)
+    visc_w = mu * laplace(w)
+
+    u_star = u + dt * (-conv_u + visc_u/rho + Fx/rho)
+    v_star = v + dt * (-conv_v + visc_v/rho + Fy/rho)
+    w_star = w + dt * (-conv_w + visc_w/rho + Fz/rho)
+
+    # --- Druck ---
+    p = pressure_poisson(p, u_star, v_star, w_star)
+
+    # --- Korrektur ---
+    u = u_star - dt/rho * ddx(p)
+    v = v_star - dt/rho * ddy(p)
+    w = w_star - dt/rho * ddz(p)
+
+    # --- Randbedingungen ---
+    u,v,w = apply_bc(u,v,w)
+
+    # --- Stabilität ---
+    u = np.clip(u, -5, 5)
+    v = np.clip(v, -5, 5)
+    w = np.clip(w, -5, 5)
+
+    if t % 20 == 0:
+        div = np.max(np.abs(divergence(u,v,w)))
+        print(f"Step {t}, div={div:.2e}")
+
+# =========================
+# Visualisierung mit pyvista
+# =========================
+
+import pyvista as pv
+
+# Grid
+x = np.linspace(0,1,nx)
+y = np.linspace(0,1,ny)
+z = np.linspace(0,1,nz)
+
+grid = pv.StructuredGrid(*np.meshgrid(x,y,z,indexing="ij"))
+
+velocity = np.stack((u,v,w), axis=-1)
+speed = np.linalg.norm(velocity, axis=3)
+
+grid["velocity"] = velocity.reshape(-1,3)
+grid["speed"] = speed.flatten()
+
+# =========================
+# Plotter
+# =========================
+plotter = pv.Plotter()
+
+# --- Reaktor (Zylinder) ---
+cylinder = pv.Cylinder(
+    center=(0.5,0.5,0.5),
+    direction=(0,0,1),
+    radius=0.45,
+    height=1.0
+)
+plotter.add_mesh(cylinder, style="wireframe", color="gray")
+
+# --- Baffles ---
+for angle in [0, 90, 180, 270]:
+    baffle = pv.Box(bounds=(
+        0.48, 0.52,
+        0.2, 0.8,
+        0, 1
+    ))
+    baffle = baffle.rotate_z(angle)
+    plotter.add_mesh(baffle, color="black")
+
+# --- Impeller ---
+impeller = pv.Disc(
+    center=(0.5,0.5,0.5),
+    inner=0.0,
+    outer=0.2,
+    normal=(0,0,1)
+)
+plotter.add_mesh(impeller, color="red")
+
+# --- Strömung ---
+streamlines = grid.streamlines(
+    vectors="velocity",
+    source_radius=0.3,
+    n_points=400,
+    max_time=400
+)
+
+plotter.add_mesh(streamlines, color="blue")
+
+# --- Volumen ---
+plotter.add_volume(grid, scalars="speed", opacity="sigmoid")
+
+plotter.add_axes()
+plotter.show()
