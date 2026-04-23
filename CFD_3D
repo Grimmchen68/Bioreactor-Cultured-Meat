@@ -1,0 +1,338 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================
+# Grid
+# =========================
+nx, ny, nz = 40, 40, 40
+
+def create_stirred_tank(nx, ny, nz):
+    mask = np.zeros((nx, ny, nz))
+
+    cx, cy = nx//2, ny//2
+    R = nx//2 - 3
+
+    z_min = 2              # Bodenhöhe
+    z_max = int(nz * 0.8) # Flüssigkeitsspiegel (80% gefüllt)
+
+    for i in range(nx):
+        for j in range(ny):
+            r2 = (i-cx)**2 + (j-cy)**2
+
+            if r2 < R**2:
+                for k in range(nz):
+
+                    # 👉 nur zwischen Boden und Flüssigkeitsspiegel
+                    if z_min <= k <= z_max:
+                        mask[i,j,k] = 1
+
+    return mask
+
+mask = create_stirred_tank(nx, ny, nz)
+
+
+dx = dy = dz = 1.0 / nx
+dt = 0.0001  # Reduziert für bessere Stabilität
+nt = 200
+
+rho = 1000.0
+mu = 0.005  # Erhöht: bessere Dämpfung
+
+# CFL-Kontroll Parameter
+max_velocity_allowed = 2.0
+CFL = max_velocity_allowed * dt / dx
+
+# =========================
+# Felder
+# =========================
+u = np.zeros((nx, ny, nz))
+v = np.zeros((nx, ny, nz))
+w = np.zeros((nx, ny, nz))
+p = np.zeros((nx, ny, nz))
+
+# =========================
+# Ableitungen
+# =========================
+def ddx(f):
+    return (np.roll(f,-1,0) - np.roll(f,1,0)) / (2*dx)
+
+def ddy(f):
+    return (np.roll(f,-1,1) - np.roll(f,1,1)) / (2*dy)
+
+def ddz(f):
+    return (np.roll(f,-1,2) - np.roll(f,1,2)) / (2*dz)
+
+def laplace(f):
+    return (
+        (np.roll(f,-1,0)-2*f+np.roll(f,1,0))/dx**2 +
+        (np.roll(f,-1,1)-2*f+np.roll(f,1,1))/dy**2 +
+        (np.roll(f,-1,2)-2*f+np.roll(f,1,2))/dz**2
+    )
+
+def divergence(u,v,w):
+    return ddx(u) + ddy(v) + ddz(w)
+
+# =========================
+# Druck
+# =========================
+def pressure_poisson(p, u_star, v_star, w_star):
+    b = rho * divergence(u_star, v_star, w_star) / dt
+
+    for _ in range(400):
+        p_new = (
+            np.roll(p,1,0) + np.roll(p,-1,0) +
+            np.roll(p,1,1) + np.roll(p,-1,1) +
+            np.roll(p,1,2) + np.roll(p,-1,2)
+        ) / 6 - dx**2 * b / 6
+
+        p_new[0,:,:]  = p_new[1,:,:]
+        p_new[-1,:,:] = p_new[-2,:,:]
+
+        p_new[:,0,:]  = p_new[:,1,:]
+        p_new[:,-1,:] = p_new[:,-2,:]
+
+        p_new[:,:,0]  = p_new[:,:,1]
+        p_new[:,:,-1] = p_new[:,:,-2]
+        # Konvergenzcheck
+        if np.max(np.abs(p_new - p)) < 1e-4:
+            break
+
+        p = p_new
+
+    return p
+
+
+# =========================
+# Impeller (rotierende Scheibe)
+# =========================
+def impeller_force():
+    Fx = np.zeros_like(u)
+    Fy = np.zeros_like(v)
+    Fz = np.zeros_like(w)
+
+    cx, cy = nx//2, ny//2
+    cz = int(nz * 0.4)
+    radius = 6
+    thickness = 2
+
+    strength = 120  # Reduziert: war 300 (zu aggressiv)
+    strength_z = 40  # Reduziert: war 100
+
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                dx_ = i - cx
+                dy_ = j - cy
+                dz_ = k - cz
+                r2 = dx_**2 + dy_**2 
+                r = np.sqrt(dx_**2 + dy_**2) + 1e-6
+
+                if r < radius and abs(dz_) < thickness:
+
+                    ex = dx_ / r
+                    ey = dy_ / r
+
+                    # 👉 NEU: realistischer Jet
+                    jet_profile = np.exp(-(r / radius)**2)
+
+                    Fx[i,j,k] = ex * strength * jet_profile
+                    Fy[i,j,k] = ey * strength * jet_profile
+
+                    # axial bleibt gleich
+                    if dz_ > 0:
+                        Fz[i,j,k] = strength_z
+                    else:
+                        Fz[i,j,k] = -strength_z
+
+    return Fx, Fy, Fz
+# =========================
+# Baffles
+# =========================
+def add_baffles(mask):
+    cx, cy = nx//2, ny//2
+    width = 2
+    length = nx//3
+
+    # 4 Baffles
+    mask[cx+length:cx+length+width, cy-1:cy+1, :] = 0
+    mask[cx-length:cx-length+width, cy-1:cy+1, :] = 0
+    mask[cx-1:cx+1, cy+length:cy+length+width, :] = 0
+    mask[cx-1:cx+1, cy-length:cy-length+width, :] = 0
+
+    return mask
+
+mask = add_baffles(mask)
+# =========================
+# Randbedingungen
+# =========================
+def apply_bc(u,v,w):
+    # No-slip: Geschwindigkeit an Wänden = 0
+    u[mask == 0] = 0
+    v[mask == 0] = 0
+    w[mask == 0] = 0
+    
+    # Dirichlet BC an Rändern
+    u[0,:,:]=u[-1,:,:]=0
+    u[:,0,:]=u[:,-1,:]=0
+    u[:,:,0]=u[:,:,-1]=0
+
+    v[0,:,:]=v[-1,:,:]=0
+    v[:,0,:]=v[:,-1,:]=0
+    v[:,:,0]=v[:,:,-1]=0
+
+    w[0,:,:]=w[-1,:,:]=0
+    w[:,0,:]=w[:,-1,:]=0
+    w[:,:,0]=w[:,:,-1]=0
+
+    return u,v,w
+
+# =========================
+# Simulation
+# =========================
+for t in range(nt):
+
+    Fx, Fy, Fz = impeller_force()
+
+    # --- Navier-Stokes (ohne Druck) ---
+    conv_u = u*ddx(u) + v*ddy(u) + w*ddz(u)
+    conv_v = u*ddx(v) + v*ddy(v) + w*ddz(v)
+    conv_w = u*ddx(w) + v*ddy(w) + w*ddz(w)
+
+    visc_u = mu * laplace(u)
+    visc_v = mu * laplace(v)
+    visc_w = mu * laplace(w)
+
+    u_star = u + dt * (-conv_u + visc_u/rho + Fx/rho)
+    v_star = v + dt * (-conv_v + visc_v/rho + Fy/rho)
+    w_star = w + dt * (-conv_w + visc_w/rho + Fz/rho)
+
+    # --- Druck ---
+    p = pressure_poisson(p, u_star, v_star, w_star)
+
+    # --- Korrektur ---
+    u = u_star - dt/rho * ddx(p)
+    v = v_star - dt/rho * ddy(p)
+    w = w_star - dt/rho * ddz(p)
+
+    # --- Randbedingungen ---
+    u,v,w = apply_bc(u,v,w)
+
+    # --- Stabilität: Clipping + Divergence Check ---
+    u = np.clip(u, -max_velocity_allowed, max_velocity_allowed)
+    v = np.clip(v, -max_velocity_allowed, max_velocity_allowed)
+    w = np.clip(w, -max_velocity_allowed, max_velocity_allowed)
+
+    # Divergenz-Monitor
+    div = np.max(np.abs(divergence(u,v,w)))
+    speed = np.sqrt(u**2 + v**2 + w**2)
+    max_speed = np.max(speed)
+    
+    # Divergence check
+    if np.isnan(div) or np.isinf(div) or div > 1.0:
+        print(f"⚠️ DIVERGENT at step {t}: div={div:.2e}")
+        print(f"Max velocity: {max_speed:.4f}, Max speed allowed: {max_velocity_allowed}")
+        print(f"CFL: {CFL:.4f}")
+        break
+
+    if t % 20 == 0:
+        print(f"Step {t:3d} | div={div:.2e} | max_u={max_speed:.3f} | CFL={CFL:.4f}")
+
+
+# =========================
+# 3D Visualisierung mit PyVista (Interaktiv)
+# =========================
+
+import pyvista as pv
+
+# Grid
+x = np.linspace(-0.5, 0.5, nx)
+y = np.linspace(-0.5, 0.5, ny)
+z = np.linspace(-0.5, 0.5, nz)
+
+grid = pv.StructuredGrid(*np.meshgrid(x, y, z, indexing="ij"))
+
+grid["mask"] = mask.flatten(order="F")
+walls = grid.threshold(value=0.5, scalars="mask").extract_surface(algorithm='dataset_surface')
+
+velocity = np.stack((u, v, w), axis=-1)
+speed = np.linalg.norm(velocity, axis=3)
+
+grid["velocity"] = velocity.reshape(-1, 3, order="F")
+grid["speed"] = speed.flatten(order="F")
+
+# =========================
+# Interaktiver Plotter
+# =========================
+
+plotter = pv.Plotter(window_size=(1400, 1000))
+
+# Wände
+plotter.add_mesh(walls, color="black", opacity=0.15, label="Walls")
+
+# Reaktor (Zylinder)
+cylinder = pv.Cylinder(
+    center=(0, 0, 0),
+    direction=(0, 0, 1),
+    radius=0.45,
+    height=1.0
+)
+plotter.add_mesh(cylinder, style="wireframe", color="gray", label="Reactor")
+
+# Impeller (Scheibe)
+impeller = pv.Disc(
+    center=(0, 0, 0),
+    inner=0.0,
+    outer=0.2,
+    normal=(0, 0, 1)
+)
+plotter.add_mesh(impeller, color="red", opacity=0.9, label="Impeller")
+
+# Streamlines
+try:
+    streamlines = grid.streamlines(
+        vectors="velocity",
+        source_radius=0.25,
+        n_points=300,
+        max_steps=400,
+        integration_direction='forward'
+    )
+    plotter.add_mesh(streamlines, color="blue", label="Streamlines", opacity=0.8)
+    print("✓ Streamlines hinzugefügt")
+except Exception as e:
+    print(f"⚠ Streamlines: {e}")
+
+# Camera
+plotter.camera_position = 'iso'
+plotter.set_scale(1, 1, 1)
+
+plotter.add_legend(loc='upper left')
+plotter.add_axes()
+
+# Title
+plotter.add_title('CFD 3D Bioreactor Streamingsimulation', color='green', 
+                   font_size=14)
+
+# Zeige interaktives Fenster
+print("🌐 Öffne interaktives 3D-Fenster...")
+print("   Bedienung: Linke Maustaste = drehen, Scroll = zoomen, Rechte Maustaste = verschieben")
+
+plotter.show()
+
+print("✓ Fenster geschlossen")
+
+# Versuche Screenshot zu speichern (funktioniert nach show)
+try:
+    # Screenshot mit einem zeitlichen Delay nach show()
+    import time
+    time.sleep(0.5)
+    image = plotter.screenshot('CFD_3D_pyvista.png')
+    print("✓ Screenshot gespeichert: CFD_3D_pyvista.png")
+except Exception as e:
+    print(f"⚠ Screenshot konnte nicht gespeichert werden: {e}")
+
+# Rohdaten
+np.savez('CFD_3D_data.npz',
+         u=u, v=v, w=w, p=p, mask=mask,
+         nx=nx, ny=ny, nz=nz, dt=dt, mu=mu, rho=rho)
+print("✓ Rohdaten gespeichert: CFD_3D_data.npz")
+print("\n✅ CFD 3D Visualisierung erfolgreich abgeschlossen!")
