@@ -1,159 +1,296 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 
+np.seterr(over='ignore', invalid='ignore')
+
 # =========================
-# Grid
+# Physikalische Dimensionen
 # =========================
-nx, ny, nz = 40, 40, 40
+volume_target = 20.0  # m^3
+height = 3.0  # m
+radius = np.sqrt(volume_target / (np.pi * height))
+diameter = 2.0 * radius
 
-def create_stirred_tank(nx, ny, nz):
-    mask = np.zeros((nx, ny, nz))
+# Reduzierte Gitterauflösung für schnellere Simulation
+nx, ny, nz = 40, 40, 48
+Lx = Ly = diameter
+Lz = height
 
-    cx, cy = nx//2, ny//2
-    R = nx//2 - 3
+n_impellers = 2  # Anzahl Rushton-Impeller
 
-    z_min = 2              # Bodenhöhe
-    z_max = int(nz * 0.8) # Flüssigkeitsspiegel (80% gefüllt)
+# =========================
+# Bioreaktor-spezifische Parameter
+# =========================
+T = 37.0  # Temperatur [°C]
+P_atm = 101325.0  # Atmosphärendruck [Pa]
+P_gas = P_atm + 50000.0  # Gasdruck über Flüssigkeit [Pa]
 
-    for i in range(nx):
-        for j in range(ny):
-            r2 = (i-cx)**2 + (j-cy)**2
+# Rührgeschwindigkeit für Impeller
+N_rpm = 100.0  # Drehzahl [1/min]
+N = N_rpm / 60.0  # Drehzahl [1/s]
 
-            if r2 < R**2:
-                for k in range(nz):
+# Belüftung
+Q_air = 0.05 * volume_target  # Volumetrischer Gasstrom [m³/s] (0.05 vvm)
 
-                    # 👉 nur zwischen Boden und Flüssigkeitsspiegel
-                    if z_min <= k <= z_max:
-                        mask[i,j,k] = 1
+# Sauerstoff-Löslichkeitsdaten (25°C, 1 atm)
+O2_sat_ref = 8.6e-3  # mol/L bei 25°C, 1 atm
+Henry_const = 769.0  # Henry-Konstante [atm/mol_fraction]
+
+# Monod-Kinetik Parameter
+X_biomass = 3.0  # Biomasse-Konzentration [g/L]
+mu_max = 0.35  # Maximale Wachstumsrate [1/h]
+K_m_O2 = 0.006  # Halbsättigungskonstante [mol/L]
+Y_XO2 = 0.8  # Ausbeute [g X / mol O2]
+
+# =========================
+# Reaktorgeometrie
+# =========================
+def create_stirred_tank(nx, ny, nz, radius, height):
+    dx = Lx / nx
+    dy = Ly / ny
+    dz = Lz / nz
+
+    x = (np.arange(nx, dtype=np.float32) + 0.5) * dx - radius
+    y = (np.arange(ny, dtype=np.float32) + 0.5) * dy - radius
+    z = (np.arange(nz, dtype=np.float32) + 0.5) * dz
+
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    radial = (X**2 + Y**2) < radius**2
+    liquid_level = 0.8 * height
+
+    mask = np.zeros((nx, ny, nz), dtype=bool)
+    mask[..., z <= liquid_level] = radial[:, :, None]
 
     return mask
 
-mask = create_stirred_tank(nx, ny, nz)
+mask = create_stirred_tank(nx, ny, nz, radius, height)
 
-
-dx = dy = dz = 1.0 / nx
-dt = 0.0001  # Reduziert für bessere Stabilität
-nt = 200
+dx = dy = Lx / nx
+dz = Lz / nz
+dt = 0.0001  # Vereinfacht für schnellere Convergenz
+nt = 500  # Standard: 500 Schritte
 
 rho = 1000.0
-mu = 0.005  # Erhöht: bessere Dämpfung
+mu = 0.005  # Dynamische Viskosität
 
 # CFL-Kontroll Parameter
-max_velocity_allowed = 2.0
+max_velocity_allowed = 1.5
 CFL = max_velocity_allowed * dt / dx
 
 # =========================
 # Felder
 # =========================
-u = np.zeros((nx, ny, nz))
-v = np.zeros((nx, ny, nz))
-w = np.zeros((nx, ny, nz))
-p = np.zeros((nx, ny, nz))
+dtype = np.float32
+u = np.zeros((nx, ny, nz), dtype=dtype)
+v = np.zeros((nx, ny, nz), dtype=dtype)
+w = np.zeros((nx, ny, nz), dtype=dtype)
+p = np.zeros((nx, ny, nz), dtype=dtype)
+
+# Sauerstoff-Konzentrationsfeld initialisieren (mol/m³)
+C_O2 = np.ones((nx, ny, nz), dtype=dtype) * 0.25e-3  # Initial: 0.25 mol/m³
+C_O2[~mask] = 0.0  # Keine O₂ außerhalb Flüssigkeit
+
+# Biomasse-Feld
+X_bio = np.ones((nx, ny, nz), dtype=dtype) * (X_biomass / 1000.0)  # mol/m³
+X_bio[~mask] = 0.0
+
+# =========================
+# Blasen-Tracking (vereinfacht - nur kLa-Feld)
+# =========================
+def update_kLa_field(impeller_speed_rpm, bubble_count):
+    """
+    Berechne lokales kLa-Feld basierend auf Rührgeschwindigkeit
+    Vereinfachtes Modell ohne explizites Bubble-Tracking
+    """
+    N_rps = impeller_speed_rpm / 60.0
+    # Basis-kLa nach empirischer Korrelation
+    kLa_base = 0.002 * (N_rps ** 0.8) * (Q_air / volume_target) ** 0.5
+    
+    # Räumliche Verteilung: höhere kLa in der Nähe der Impeller
+    kLa_field = np.ones((nx, ny, nz), dtype=np.float32) * kLa_base * 0.5
+    
+    # Erhöhe kLa um Impeller-Zonen
+    z_imp = np.array([0.30, 0.65]) * nz
+    for z_c in z_imp:
+        iz = int(z_c)
+        for k in range(max(0, iz-3), min(nz, iz+4)):
+            dist_factor = np.exp(-(k - z_c)**2 / 4.0)
+            kLa_field[:, :, k] = np.maximum(
+                kLa_field[:, :, k],
+                kLa_base * 1.5 * dist_factor
+            )
+    
+    return kLa_field
 
 # =========================
 # Ableitungen
 # =========================
 def ddx(f):
-    return (np.roll(f,-1,0) - np.roll(f,1,0)) / (2*dx)
+    df = np.zeros_like(f)
+    df[1:-1,:,:] = (f[2:,:,:] - f[:-2,:,:]) / (2*dx)
+    return df
 
 def ddy(f):
-    return (np.roll(f,-1,1) - np.roll(f,1,1)) / (2*dy)
+    df = np.zeros_like(f)
+    df[:,1:-1,:] = (f[:,2:,:] - f[:,:-2,:]) / (2*dy)
+    return df
 
 def ddz(f):
-    return (np.roll(f,-1,2) - np.roll(f,1,2)) / (2*dz)
+    df = np.zeros_like(f)
+    df[:,:,1:-1] = (f[:,:,2:] - f[:,:,:-2]) / (2*dz)
+    return df
 
 def laplace(f):
-    return (
-        (np.roll(f,-1,0)-2*f+np.roll(f,1,0))/dx**2 +
-        (np.roll(f,-1,1)-2*f+np.roll(f,1,1))/dy**2 +
-        (np.roll(f,-1,2)-2*f+np.roll(f,1,2))/dz**2
+    lap = np.zeros_like(f)
+    lap[1:-1,1:-1,1:-1] = (
+        (f[2:,1:-1,1:-1] - 2*f[1:-1,1:-1,1:-1] + f[:-2,1:-1,1:-1]) / dx**2 +
+        (f[1:-1,2:,1:-1] - 2*f[1:-1,1:-1,1:-1] + f[1:-1,:-2,1:-1]) / dy**2 +
+        (f[1:-1,1:-1,2:] - 2*f[1:-1,1:-1,1:-1] + f[1:-1,1:-1,:-2]) / dz**2
     )
+    return lap
+
+def upwind_x(u, f):
+    df = np.zeros_like(f)
+    df[1:-1,:,:] = np.where(
+        u[1:-1,:,:] > 0,
+        (f[1:-1,:,:] - f[:-2,:,:]) / dx,
+        (f[2:,:,:] - f[1:-1,:,:]) / dx
+    )
+    return df
+
+def upwind_y(v, f):
+    df = np.zeros_like(f)
+    df[:,1:-1,:] = np.where(
+        v[:,1:-1,:] > 0,
+        (f[:,1:-1,:] - f[:,:-2,:]) / dy,
+        (f[:,2:,:] - f[:,1:-1,:]) / dy
+    )
+    return df
+
+def upwind_z(w, f):
+    df = np.zeros_like(f)
+    df[:,:,1:-1] = np.where(
+        w[:,:,1:-1] > 0,
+        (f[:,:,1:-1] - f[:,:,:-2]) / dz,
+        (f[:,:,2:] - f[:,:,1:-1]) / dz
+    )
+    return df
 
 def divergence(u,v,w):
     return ddx(u) + ddy(v) + ddz(w)
+
+# =========================
+# Bioreaktor-Funktionen
+# =========================
+def henry_saturation(T_celsius, P_gas_pa):
+    """O2-Sättigungskonzentration via Henry's Law"""
+    H_T = Henry_const * np.exp(0.016 * (T_celsius - 25.0))
+    P_gas_atm = P_gas_pa / 101325.0
+    X_O2 = 0.21
+    P_O2 = P_gas_atm * X_O2
+    C_sat = (P_O2 / H_T) * 1000.0
+    return C_sat
+
+def oxygen_transfer_rate(C_O2_local, C_sat, kLa_local):
+    """Berechne lokale Sauerstoff-Transferrate"""
+    return np.maximum(kLa_local * (C_sat - C_O2_local), 0.0)
+
+def monod_respiration(C_O2_local, X_local):
+    """Biologischer O2-Verbrauch nach Monod-Kinetik"""
+    return mu_max * X_local * (C_O2_local / (K_m_O2 + C_O2_local)) / Y_XO2 / 3600.0
 
 # =========================
 # Druck
 # =========================
 def pressure_poisson(p, u_star, v_star, w_star):
     b = rho * divergence(u_star, v_star, w_star) / dt
+    b[~mask] = 0
 
-    for _ in range(400):
-        p_new = (
-            np.roll(p,1,0) + np.roll(p,-1,0) +
-            np.roll(p,1,1) + np.roll(p,-1,1) +
-            np.roll(p,1,2) + np.roll(p,-1,2)
-        ) / 6 - dx**2 * b / 6
+    omega = 1.0
+    tol = 1e-5
+    coeff = dx**2
 
-        p_new[0,:,:]  = p_new[1,:,:]
-        p_new[-1,:,:] = p_new[-2,:,:]
+    for _ in range(80):
+        p_old = p[1:-1,1:-1,1:-1].copy()
 
-        p_new[:,0,:]  = p_new[:,1,:]
-        p_new[:,-1,:] = p_new[:,-2,:]
+        neighbor_sum = (
+            p[2:,1:-1,1:-1] + p[:-2,1:-1,1:-1] +
+            p[1:-1,2:,1:-1] + p[1:-1,:-2,1:-1] +
+            p[1:-1,1:-1,2:] + p[1:-1,1:-1,:-2]
+        )
 
-        p_new[:,:,0]  = p_new[:,:,1]
-        p_new[:,:,-1] = p_new[:,:,-2]
-        # Konvergenzcheck
-        if np.max(np.abs(p_new - p)) < 1e-4:
+        p_new = (neighbor_sum - coeff * b[1:-1,1:-1,1:-1]) / 6.0
+        p_relaxed = p_old + omega * (p_new - p_old)
+
+        p[1:-1,1:-1,1:-1][mask_int] = p_relaxed[mask_int]
+        p[~mask] = 0
+
+        p[0,:,:]  = p[1,:,:]
+        p[-1,:,:] = p[-2,:,:]
+        p[:,0,:]  = p[:,1,:]
+        p[:,-1,:] = p[:,-2,:]
+        p[:,:,0]  = p[:,:,1]
+        p[:,:,-1] = p[:,:,-2]
+
+        if np.max(np.abs(p[1:-1,1:-1,1:-1] - p_old)) < tol:
             break
-
-        p = p_new
 
     return p
 
-
 # =========================
-# Impeller (rotierende Scheibe)
+# Impeller (Rushton)
 # =========================
-def impeller_force():
-    Fx = np.zeros_like(u)
-    Fy = np.zeros_like(v)
-    Fz = np.zeros_like(w)
+def impeller_force(num_impellers=n_impellers):
+    x = (np.arange(nx, dtype=np.float32) + 0.5) * dx - radius
+    y = (np.arange(ny, dtype=np.float32) + 0.5) * dy - radius
+    z = (np.arange(nz, dtype=np.float32) + 0.5) * dz
 
-    cx, cy = nx//2, ny//2
-    cz = int(nz * 0.4)
-    radius = 6
-    thickness = 2
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    R = np.sqrt(X**2 + Y**2) + 1e-6
 
-    strength = 120  # Reduziert: war 300 (zu aggressiv)
-    strength_z = 40  # Reduziert: war 100
+    if num_impellers == 2:
+        impeller_z = np.array([0.30, 0.65], dtype=np.float32) * Lz
+    else:
+        impeller_z = np.linspace(0.25 * Lz, 0.75 * Lz, num_impellers, dtype=np.float32)
 
-    for i in range(nx):
-        for j in range(ny):
-            for k in range(nz):
-                dx_ = i - cx
-                dy_ = j - cy
-                dz_ = k - cz
-                r2 = dx_**2 + dy_**2 
-                r = np.sqrt(dx_**2 + dy_**2) + 1e-6
+    impeller_radius = 0.25 * radius
+    impeller_thickness = 0.05 * Lz
+    radial_blade_radius = 0.22 * radius
+    radial_blade_width = 0.08 * radius
 
-                if r < radius and abs(dz_) < thickness:
+    strength_radial = np.float32(260.0)
+    strength_axial = np.float32(80.0)
 
-                    ex = dx_ / r
-                    ey = dy_ / r
+    Fx = np.zeros((nx, ny, nz), dtype=np.float32)
+    Fy = np.zeros((nx, ny, nz), dtype=np.float32)
+    Fz = np.zeros((nx, ny, nz), dtype=np.float32)
 
-                    # 👉 NEU: realistischer Jet
-                    jet_profile = np.exp(-(r / radius)**2)
+    radial_profile = np.exp(-((R - radial_blade_radius) / radial_blade_width)**2).astype(np.float32)
+    tangential_x = -Y / R * strength_radial * radial_profile
+    tangential_y = X / R * strength_radial * radial_profile
+    radial_profile_3d = radial_profile[:, :, None]
 
-                    Fx[i,j,k] = ex * strength * jet_profile
-                    Fy[i,j,k] = ey * strength * jet_profile
+    z_grid = z[None, None, :]
+    axial_sign = np.where(z_grid >= impeller_z[:, None, None, None], 1.0, -1.0)
+    z_profile = np.exp(-((z_grid - impeller_z[:, None, None, None]) / (impeller_thickness * 0.5))**2).astype(np.float32)
 
-                    # axial bleibt gleich
-                    if dz_ > 0:
-                        Fz[i,j,k] = strength_z
-                    else:
-                        Fz[i,j,k] = -strength_z
+    for idx in range(num_impellers):
+        weight = z_profile[idx]
+        Fx += tangential_x[:, :, None] * weight
+        Fy += tangential_y[:, :, None] * weight
+        Fz += strength_axial * axial_sign[idx] * weight * radial_profile_3d
 
     return Fx, Fy, Fz
+
 # =========================
 # Baffles
 # =========================
 def add_baffles(mask):
     cx, cy = nx//2, ny//2
-    width = 2
-    length = nx//3
+    width = 1
+    length = nx//4
 
-    # 4 Baffles
     mask[cx+length:cx+length+width, cy-1:cy+1, :] = 0
     mask[cx-length:cx-length+width, cy-1:cy+1, :] = 0
     mask[cx-1:cx+1, cy+length:cy+length+width, :] = 0
@@ -162,16 +299,34 @@ def add_baffles(mask):
     return mask
 
 mask = add_baffles(mask)
+
+# =========================
+# Welle Oberfläche
+# =========================
+def add_shaft(mask):
+    cx, cy = nx//2, ny//2
+    r_shaft = int(max(2, 0.04 * nx))
+
+    x = np.arange(nx) - cx
+    y = np.arange(ny) - cy
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    shaft = (X**2 + Y**2) < r_shaft**2
+    mask[shaft, :] = 0
+
+    return mask
+
+mask = add_shaft(mask)
+mask_int = mask[1:-1,1:-1,1:-1]
+Fx, Fy, Fz = impeller_force()
+
 # =========================
 # Randbedingungen
 # =========================
 def apply_bc(u,v,w):
-    # No-slip: Geschwindigkeit an Wänden = 0
     u[mask == 0] = 0
     v[mask == 0] = 0
     w[mask == 0] = 0
     
-    # Dirichlet BC an Rändern
     u[0,:,:]=u[-1,:,:]=0
     u[:,0,:]=u[:,-1,:]=0
     u[:,:,0]=u[:,:,-1]=0
@@ -187,24 +342,60 @@ def apply_bc(u,v,w):
     return u,v,w
 
 # =========================
+# Monitoring und Historien
+# =========================
+history = {
+    'time': [],
+    'OTR': [],
+    'C_O2_avg': [],
+    'C_O2_max': [],
+    'max_velocity': []
+}
+
+# =========================
 # Simulation
 # =========================
 for t in range(nt):
+    speed = np.sqrt(u**2 + v**2 + w**2)
+    max_speed = np.max(speed) + 1e-6
 
-    Fx, Fy, Fz = impeller_force()
+    CFL_target = 0.3
+    dt = CFL_target * dx / max_speed
+    dt = min(dt, 0.0001)
 
     # --- Navier-Stokes (ohne Druck) ---
-    conv_u = u*ddx(u) + v*ddy(u) + w*ddz(u)
-    conv_v = u*ddx(v) + v*ddy(v) + w*ddz(v)
-    conv_w = u*ddx(w) + v*ddy(w) + w*ddz(w)
+    conv_u = u*upwind_x(u,u) + v*upwind_y(v,u) + w*upwind_z(w,u)
+    conv_v = u*upwind_x(u,v) + v*upwind_y(v,v) + w*upwind_z(w,v)
+    conv_w = u*upwind_x(u,w) + v*upwind_y(v,w) + w*upwind_z(w,w)
 
-    visc_u = mu * laplace(u)
-    visc_v = mu * laplace(v)
-    visc_w = mu * laplace(w)
+    nu = mu / rho
 
-    u_star = u + dt * (-conv_u + visc_u/rho + Fx/rho)
-    v_star = v + dt * (-conv_v + visc_v/rho + Fy/rho)
-    w_star = w + dt * (-conv_w + visc_w/rho + Fz/rho)
+    visc_u = nu * laplace(u)
+    visc_v = nu * laplace(v)
+    visc_w = nu * laplace(w)
+
+    u_star = u + dt * (-conv_u + visc_u + Fx/rho)
+    v_star = v + dt * (-conv_v + visc_v + Fy/rho)
+    w_star = w + dt * (-conv_w + visc_w + Fz/rho)
+    
+    D_O2 = 3e-9
+
+    # --- Sauerstoff-Transfer ---
+    C_sat = henry_saturation(T, P_gas)
+    kLa_field = update_kLa_field(N_rpm, len(history['time']))
+    
+    OTR_local = oxygen_transfer_rate(C_O2, C_sat, kLa_field)
+    respiration_local = monod_respiration(C_O2, X_bio)
+    
+    conv_O2 = (
+        u * upwind_x(u, C_O2) +
+        v * upwind_y(v, C_O2) +
+        w * upwind_z(w, C_O2)
+    )
+
+    diff_O2 = D_O2 * laplace(C_O2)
+
+    C_O2 = C_O2 + dt * (-conv_O2 + diff_O2 + OTR_local - respiration_local)
 
     # --- Druck ---
     p = pressure_poisson(p, u_star, v_star, w_star)
@@ -217,149 +408,131 @@ for t in range(nt):
     # --- Randbedingungen ---
     u,v,w = apply_bc(u,v,w)
 
-    # --- Stabilität: Clipping + Divergence Check ---
+    # --- Dämpfung ---
+    damping = 0.995
+    u *= damping
+    v *= damping
+    w *= damping
+
+    u[mask == 0] = 0
+    v[mask == 0] = 0
+    w[mask == 0] = 0
+    C_O2[mask == 0] = 0
+    X_bio[mask == 0] = 0
+    
     u = np.clip(u, -max_velocity_allowed, max_velocity_allowed)
     v = np.clip(v, -max_velocity_allowed, max_velocity_allowed)
     w = np.clip(w, -max_velocity_allowed, max_velocity_allowed)
+    C_O2 = np.clip(C_O2, 0.0, C_sat.max())
 
     # Divergenz-Monitor
     div = np.max(np.abs(divergence(u,v,w)))
     speed = np.sqrt(u**2 + v**2 + w**2)
-    max_speed = np.max(speed)
-    
-    # Divergence check
-    if np.isnan(div) or np.isinf(div) or div > 1.0:
-        print(f"⚠️ DIVERGENT at step {t}: div={div:.2e}")
-        print(f"Max velocity: {max_speed:.4f}, Max speed allowed: {max_velocity_allowed}")
-        print(f"CFL: {CFL:.4f}")
+    max_speed = np.max(speed) + 1e-6
+
+    CFL_target = 0.3
+    dt = CFL_target * dx / max_speed
+    dt = min(dt, 0.0001)
+
+    if np.isnan(div) or np.isinf(div) or div > 5.0:
+        print(f"DIVERGENT at step {t}: div={div:.2e}")
         break
 
-    if t % 20 == 0:
-        print(f"Step {t:3d} | div={div:.2e} | max_u={max_speed:.3f} | CFL={CFL:.4f}")
-
-
-# =========================
-# 3D Visualisierung mit PyVista (Interaktiv)
-# =========================
-
-import pyvista as pv
-
-# Grid
-x = np.linspace(-0.5, 0.5, nx)
-y = np.linspace(-0.5, 0.5, ny)
-z = np.linspace(-0.5, 0.5, nz)
-
-grid = pv.StructuredGrid(*np.meshgrid(x, y, z, indexing="ij"))
-
-velocity = np.stack((u, v, w), axis=-1)
-
-grid["mask"] = mask.flatten(order="F")
-grid["velocity"] = velocity.reshape(nx, ny, nz, 3, order="C").reshape(-1, 3)
-
-fluid = grid.threshold(value=0.5, scalars="mask")
-
-fluid["speed"] = np.linalg.norm(fluid["velocity"], axis=1)
-
-walls = grid.threshold(value=0.5, scalars="mask").extract_surface(algorithm='dataset_surface')
-
-
-
+    # Globale OTR-Berechnung
+    OTR_global = np.sum(OTR_local[mask]) / np.sum(mask) * 3600.0 * 1000.0
+    C_O2_avg = np.mean(C_O2[mask])
+    C_O2_max = np.max(C_O2[mask])
+    
+    history['time'].append(t * dt)
+    history['OTR'].append(OTR_global)
+    history['C_O2_avg'].append(C_O2_avg)
+    history['C_O2_max'].append(C_O2_max)
+    history['max_velocity'].append(max_speed)
+    
+    if t % 50 == 0:
+        print(
+            f"Step {t:4d}/{nt} | "
+            f"C_O2={C_O2_avg:.3e} mol/m3 | "
+            f"OTR={OTR_global:.2f} mmol/(L*h) | "
+            f"max_u={max_speed:.4f} m/s"
+        )
 
 # =========================
-# Interaktiver Plotter
+# Ausgabe und Visualisierung
 # =========================
+output_dir = "results"
+os.makedirs(output_dir, exist_ok=True)
+mid = nz // 2
+speed = np.sqrt(u**2 + v**2 + w**2)
 
-plotter = pv.Plotter(window_size=(1400, 1000))
+# Feldplots
+fields = [
+    (C_O2, "O2 Concentration [mol/m3]", "plasma", "O2_concentration"),
+    (speed, "Speed [m/s]", "turbo", "velocity_speed"),
+    (p, "Pressure [Pa]", "coolwarm", "pressure_field"),
+    (w, "Axial velocity w [m/s]", "bwr", "w_velocity"),
+]
 
-vmax = np.max(fluid["speed"])
+for field, label, cmap, name in fields:
+    plt.figure(figsize=(6,5))
+    plt.imshow(field[:, :, mid], origin="lower", cmap=cmap)
+    plt.colorbar(label=label)
+    plt.title(f"{label} (mid-plane)")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{name}.png"), dpi=150)
+    plt.close()
 
-plotter.add_mesh(
-    fluid,
-    scalars="speed",
-    cmap="turbo",
-    clim=[0, vmax],
-    lighting=False,
-    opacity=0.6,
-    label="Fluid Speed"
-)
-# Wände
+# Zeitverlauf-Plots
+time_array = np.array(history['time'])
 
-plotter.add_mesh(walls, color="black", opacity=0.2, label="Walls")
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
+axes[0, 0].plot(time_array, history['OTR'], 'b-', linewidth=2)
+axes[0, 0].set_xlabel('Time [s]')
+axes[0, 0].set_ylabel('OTR [mmol/(L*h)]')
+axes[0, 0].set_title('Oxygen Transfer Rate')
+axes[0, 0].grid(True, alpha=0.3)
 
+axes[0, 1].plot(time_array, np.array(history['C_O2_avg'])*1000, 'g-', label='Average', linewidth=2)
+axes[0, 1].plot(time_array, np.array(history['C_O2_max'])*1000, 'r--', label='Maximum', linewidth=2)
+axes[0, 1].set_xlabel('Time [s]')
+axes[0, 1].set_ylabel('C_O2 [mmol/m3]')
+axes[0, 1].set_title('Oxygen Concentration')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
 
-# Reaktor 
+axes[1, 0].plot(time_array, history['max_velocity'], 'orange', linewidth=2)
+axes[1, 0].set_xlabel('Time [s]')
+axes[1, 0].set_ylabel('Max Velocity [m/s]')
+axes[1, 0].set_title('Flow Field Dynamics')
+axes[1, 0].grid(True, alpha=0.3)
 
+axes[1, 1].text(0.1, 0.9, f"Reactor: {volume_target:.0f} m3\nN: {N_rpm:.0f} rpm\nT: {T:.0f}C\nP_gas: {P_gas/1e5:.2f} bar", 
+                transform=axes[1, 1].transAxes, fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+axes[1, 1].axis('off')
 
-# Impeller (Scheibe)
-z_imp = z[int(nz * 0.4)]
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "timeseries.png"), dpi=150)
+plt.close()
 
-impeller = pv.Disc(
-    center=(0, 0, z_imp),
-    inner=0.0,
-    outer=0.2,
-    normal=(0, 0, 1)
-)
-plotter.add_mesh(impeller, color="red", opacity=0.9, label="Impeller")
-
-# Streamlines
-try:
-    streamlines = fluid.streamlines(
-        vectors="velocity",
-        source_radius=0.2,
-        n_points=200,
-        max_steps=300
-    )
-
-    plotter.add_mesh(streamlines, color="blue", opacity=0.8)
-
-    print("✓ Streamlines hinzugefügt")
-except Exception as e:
-    print(f"⚠ Streamlines: {e}")
-
-#Surface 
-surface_z = z[int(nz * 0.8)]
-
-surface = pv.Plane(
-    center=(0,0,surface_z),
-    direction=(0,0,1),
-    i_size=1.0,
-    j_size=1.0
-)
-
-plotter.add_mesh(surface, color="lightblue", opacity=0.3, label="Fluid Surface")
-# Camera
-plotter.camera_position = 'iso'
-plotter.set_scale(1, 1, 1)
-
-plotter.add_legend(loc='upper left')
-plotter.add_axes()
-
-# Title
-plotter.add_title('CFD 3D Bioreactor Streamingsimulation', color='green', 
-                   font_size=14)
-
-# Zeige interaktives Fenster
-print("🌐 Öffne interaktives 3D-Fenster...")
-print("   Bedienung: Linke Maustaste = drehen, Scroll = zoomen, Rechte Maustaste = verschieben")
-
-plotter.show()
-
-print("✓ Fenster geschlossen")
-
-# Versuche Screenshot zu speichern (funktioniert nach show)
-try:
-    # Screenshot mit einem zeitlichen Delay nach show()
-    import time
-    time.sleep(0.5)
-    image = plotter.screenshot('CFD_3D_pyvista.png')
-    print("✓ Screenshot gespeichert: CFD_3D_pyvista.png")
-except Exception as e:
-    print(f"⚠ Screenshot konnte nicht gespeichert werden: {e}")
-
-# Rohdaten
-np.savez('CFD_3D_data.npz',
-         u=u, v=v, w=w, p=p, mask=mask,
-         nx=nx, ny=ny, nz=nz, dt=dt, mu=mu, rho=rho)
-print("✓ Rohdaten gespeichert: CFD_3D_data.npz")
-print("\n✅ CFD 3D Visualisierung erfolgreich abgeschlossen!")
+# Summary
+print("\n" + "="*60)
+print("BIOREACTOR OTR SIMULATION SUMMARY")
+print("="*60)
+print(f"Reactor Volume: {volume_target:.1f} m3")
+print(f"Reactor Geometry: D={diameter:.2f}m, H={height:.2f}m")
+print(f"Impeller Configuration: {n_impellers} Rushton turbines @ {N_rpm:.0f} rpm")
+print(f"Aeration: {Q_air:.4f} m3/s ({Q_air/volume_target:.2f} vvm)")
+print(f"Temperature: {T:.0f}C, Pressure: {P_gas/1e5:.2f} bar")
+print(f"O2 Saturation: {henry_saturation(T, P_gas)*1000:.2f} mmol/m3")
+print(f"\nResults:")
+print(f"  Simulation Time: {time_array[-1]:.2f} s")
+print(f"  Avg OTR (last 50%): {np.mean(history['OTR'][int(len(history['OTR'])*0.5):]):.2f} mmol/(L*h)")
+print(f"  Max OTR: {np.max(history['OTR']):.2f} mmol/(L*h)")
+print(f"  Final C_O2: {history['C_O2_avg'][-1]*1000:.3f} mmol/m3")
+print(f"  Max Velocity: {np.max(history['max_velocity']):.6f} m/s")
+print(f"\nPlots saved to: {os.path.abspath(output_dir)}")
+print("="*60)
