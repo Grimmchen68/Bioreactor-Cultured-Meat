@@ -27,7 +27,7 @@ P_atm = 101325.0  # Atmosphärendruck [Pa]
 P_gas = P_atm + 50000.0  # Gasdruck über Flüssigkeit [Pa]
 
 # Rührgeschwindigkeit für Impeller
-N_rpm = 100.0  # Drehzahl [1/min]
+N_rpm = 200.0  # Drehzahl [1/min]
 N = N_rpm / 60.0  # Drehzahl [1/s]
 
 # Belüftung
@@ -38,10 +38,24 @@ O2_sat_ref = 8.6e-3  # mol/L bei 25°C, 1 atm
 Henry_const = 769.0  # Henry-Konstante [atm/mol_fraction]
 
 # Monod-Kinetik Parameter
-X_biomass = 3.0  # Biomasse-Konzentration [g/L]
+X_biomass = 50.0  # Biomasse-Konzentration [g/L] - erhöht für realistische Wärmeproduktion
 mu_max = 0.35  # Maximale Wachstumsrate [1/h]
-K_m_O2 = 0.006  # Halbsättigungskonstante [mol/L]
-Y_XO2 = 0.8  # Ausbeute [g X / mol O2]
+K_m_O2 = 6.0  # Halbsättigungskonstante [mol/m³] (0.006 mol/L -> 6 mol/m³)
+Y_XO2 = 0.4  # Ertragskoeffizient [g X / g O2] - korrigiert für realistische Werte
+
+# Thermische Parameter
+T_ref = 37.0  # Referenztemperatur [°C]
+T_wall = 35.0  # Wandtemperatur [°C] (Kühlung)
+alpha_heat = 1e-7  # Thermische Diffusivität [m²/s] - reduziert für Stabilität
+rho_cp = 4.18e6  # Volumetrische Wärmekapazität [J/(m³·K)]
+h_wall = 50.0  # Wärmeübergangskoeffizient Wand [W/(m²·K)]
+A_wall = 2 * np.pi * radius * height  # Wandfläche [m²]
+V_liquid = volume_target * 0.8  # Flüssigkeitsvolumen [m³]
+
+# Biologische Wärmeproduktion
+delta_H_bio = -250e3  # Enthalpie der biologischen O2-Nutzung [J/mol O2]
+# (negativ = exotherm, positiv = endotherm)
+demo_heat_boost = 1.0  # 1.0 = realistisch, >1 für schnellere Demo im kurzen Simulationsfenster
 
 # =========================
 # Reaktorgeometrie
@@ -68,8 +82,8 @@ mask = create_stirred_tank(nx, ny, nz, radius, height)
 
 dx = dy = Lx / nx
 dz = Lz / nz
-dt = 0.0001  # Vereinfacht für schnellere Convergenz
-nt = 500  # Standard: 500 Schritte
+dt = 0.001  # Erhöht für schnellere thermische Entwicklung
+nt = 10000  # Optimiert für thermische Demonstration
 
 rho = 1000.0
 mu = 0.005  # Dynamische Viskosität
@@ -88,12 +102,16 @@ w = np.zeros((nx, ny, nz), dtype=dtype)
 p = np.zeros((nx, ny, nz), dtype=dtype)
 
 # Sauerstoff-Konzentrationsfeld initialisieren (mol/m³)
-C_O2 = np.ones((nx, ny, nz), dtype=dtype) * 0.25e-3  # Initial: 0.25 mol/m³
+C_O2 = np.ones((nx, ny, nz), dtype=dtype) * 0.25  # Initial: 0.25 mol/m³
 C_O2[~mask] = 0.0  # Keine O₂ außerhalb Flüssigkeit
 
 # Biomasse-Feld
-X_bio = np.ones((nx, ny, nz), dtype=dtype) * (X_biomass / 1000.0)  # mol/m³
+X_bio = np.ones((nx, ny, nz), dtype=dtype) * X_biomass  # g/L = kg/m³
 X_bio[~mask] = 0.0
+
+# Temperatur-Feld
+T = np.ones((nx, ny, nz), dtype=dtype) * T_ref  # Temperatur [°C]
+T[~mask] = T_wall  # Wandtemperatur
 
 # =========================
 # Blasen-Tracking (vereinfacht - nur kLa-Feld)
@@ -183,22 +201,45 @@ def divergence(u,v,w):
 # =========================
 # Bioreaktor-Funktionen
 # =========================
-def henry_saturation(T_celsius, P_gas_pa):
-    """O2-Sättigungskonzentration via Henry's Law"""
-    H_T = Henry_const * np.exp(0.016 * (T_celsius - 25.0))
+def henry_saturation(T_local, P_gas_pa):
+    """
+    O2-Sättigungskonzentration via Henry's Law
+    T_local: lokale Temperatur [°C]
+    """
+    # Temperaturabhängige Henry-Konstante
+    H_T = Henry_const * np.exp(0.016 * (T_local - 25.0))
     P_gas_atm = P_gas_pa / 101325.0
     X_O2 = 0.21
     P_O2 = P_gas_atm * X_O2
-    C_sat = (P_O2 / H_T) * 1000.0
+    C_sat = (P_O2 / H_T) * 1000.0  # mol/m³
     return C_sat
 
 def oxygen_transfer_rate(C_O2_local, C_sat, kLa_local):
     """Berechne lokale Sauerstoff-Transferrate"""
     return np.maximum(kLa_local * (C_sat - C_O2_local), 0.0)
 
-def monod_respiration(C_O2_local, X_local):
-    """Biologischer O2-Verbrauch nach Monod-Kinetik"""
-    return mu_max * X_local * (C_O2_local / (K_m_O2 + C_O2_local)) / Y_XO2 / 3600.0
+def monod_respiration(C_O2_local, X_local, T_local):
+    """
+    Biologischer O2-Verbrauch nach Monod-Kinetik mit Temperaturabhängigkeit
+    """
+    # Spezifische Respirationsrate [mol O2 / kg X / s]
+    q_O2_base = 10e-3 / 3600  # 10 mmol/g/h -> mol/kg/s (32e-3 ist bereits in mmol/g)
+    
+    # Temperaturabhängigkeit nach Arrhenius
+    k_T = np.exp(0.1 * (T_local - T_ref))  # Aktivierungsenergie-Effekt
+    q_O2_T = q_O2_base * k_T
+    
+    # Monod-Kinetik für O2-Limitation
+    respiration = q_O2_T * X_local * (C_O2_local / (K_m_O2 + C_O2_local))
+    return respiration
+
+def biological_heat_generation(respiration_rate):
+    """
+    Biologische Wärmeproduktion
+    respiration_rate: mol O2/(m³·s)
+    Rückgabe: Wärmeproduktionsrate [W/m³]
+    """
+    return -delta_H_bio * respiration_rate  # [J/(mol·s)] * [mol/(m³·s)] = [J/(m³·s)] = [W/m³]
 
 # =========================
 # Druck
@@ -349,6 +390,8 @@ history = {
     'OTR': [],
     'C_O2_avg': [],
     'C_O2_max': [],
+    'T_avg': [],
+    'T_max': [],
     'max_velocity': []
 }
 
@@ -361,7 +404,7 @@ for t in range(nt):
 
     CFL_target = 0.3
     dt = CFL_target * dx / max_speed
-    dt = min(dt, 0.0001)
+    dt = min(dt, 0.001)
 
     # --- Navier-Stokes (ohne Druck) ---
     conv_u = u*upwind_x(u,u) + v*upwind_y(v,u) + w*upwind_z(w,u)
@@ -385,7 +428,13 @@ for t in range(nt):
     kLa_field = update_kLa_field(N_rpm, len(history['time']))
     
     OTR_local = oxygen_transfer_rate(C_O2, C_sat, kLa_field)
-    respiration_local = monod_respiration(C_O2, X_bio)
+    respiration_local = monod_respiration(C_O2, X_bio, T)
+    
+    # Berechne globale OUR
+    OUR_global = np.mean(respiration_local[mask]) * 3600.0 * 1000.0
+    
+    # Biologische Wärmeproduktion
+    Q_bio = biological_heat_generation(respiration_local) * demo_heat_boost
     
     conv_O2 = (
         u * upwind_x(u, C_O2) +
@@ -396,6 +445,28 @@ for t in range(nt):
     diff_O2 = D_O2 * laplace(C_O2)
 
     C_O2 = C_O2 + dt * (-conv_O2 + diff_O2 + OTR_local - respiration_local)
+
+    # --- Temperatur-Transport ---
+    conv_T = (
+        u * upwind_x(u, T) +
+        v * upwind_y(v, T) +
+        w * upwind_z(w, T)
+    )
+
+    diff_T = alpha_heat * laplace(T)
+
+    # Wärmeübergang an der Wand (vereinfacht)
+    Q_wall = np.zeros_like(T)
+    wall_adj = np.zeros_like(mask, dtype=bool)
+    wall_adj[1:,:,:]  |= mask[1:,:,:]  & ~mask[:-1,:,:]
+    wall_adj[:-1,:,:] |= mask[:-1,:,:] & ~mask[1:,:,:]
+    wall_adj[:,1:,:]  |= mask[:,1:,:]  & ~mask[:,:-1,:]
+    wall_adj[:,:-1,:] |= mask[:,:-1,:] & ~mask[:,1:,:]
+    wall_adj[:,:,1:]  |= mask[:,:,1:]  & ~mask[:,:,:-1]
+    wall_adj[:,:,:-1] |= mask[:,:,:-1] & ~mask[:,:,1:]
+    Q_wall[wall_adj] = h_wall * (T_wall - T[wall_adj]) / dz  # Wärmefluss pro Volumen
+
+    T = T + dt * (-conv_T + diff_T + Q_bio / rho_cp + Q_wall / rho_cp)
 
     # --- Druck ---
     p = pressure_poisson(p, u_star, v_star, w_star)
@@ -419,11 +490,13 @@ for t in range(nt):
     w[mask == 0] = 0
     C_O2[mask == 0] = 0
     X_bio[mask == 0] = 0
+    T[~mask] = T_wall  # Wandtemperatur-Randbedingung
     
     u = np.clip(u, -max_velocity_allowed, max_velocity_allowed)
     v = np.clip(v, -max_velocity_allowed, max_velocity_allowed)
     w = np.clip(w, -max_velocity_allowed, max_velocity_allowed)
     C_O2 = np.clip(C_O2, 0.0, C_sat.max())
+    T = np.clip(T, 20.0, 50.0)  # Temperaturbereich begrenzen
 
     # Divergenz-Monitor
     div = np.max(np.abs(divergence(u,v,w)))
@@ -432,7 +505,7 @@ for t in range(nt):
 
     CFL_target = 0.3
     dt = CFL_target * dx / max_speed
-    dt = min(dt, 0.0001)
+    dt = min(dt, 0.001)
 
     if np.isnan(div) or np.isinf(div) or div > 5.0:
         print(f"DIVERGENT at step {t}: div={div:.2e}")
@@ -442,18 +515,23 @@ for t in range(nt):
     OTR_global = np.sum(OTR_local[mask]) / np.sum(mask) * 3600.0 * 1000.0
     C_O2_avg = np.mean(C_O2[mask])
     C_O2_max = np.max(C_O2[mask])
+    T_avg = np.mean(T[mask])
+    T_max = np.max(T[mask])
     
     history['time'].append(t * dt)
     history['OTR'].append(OTR_global)
     history['C_O2_avg'].append(C_O2_avg)
     history['C_O2_max'].append(C_O2_max)
+    history['T_avg'].append(T_avg)
+    history['T_max'].append(T_max)
     history['max_velocity'].append(max_speed)
     
-    if t % 50 == 0:
+    if t % 500 == 0:
         print(
             f"Step {t:4d}/{nt} | "
             f"C_O2={C_O2_avg:.3e} mol/m3 | "
-            f"OTR={OTR_global:.2f} mmol/(L*h) | "
+            f"T={T_avg:.2f}°C | "
+            f"OTR={OTR_global:.2f} mmol/(L*h) | OUR={OUR_global:.2f} mmol/(L*h) | "
             f"max_u={max_speed:.4f} m/s"
         )
 
@@ -468,6 +546,7 @@ speed = np.sqrt(u**2 + v**2 + w**2)
 # Feldplots
 fields = [
     (C_O2, "O2 Concentration [mol/m3]", "plasma", "O2_concentration"),
+    (T, "Temperature [°C]", "hot", "temperature_field"),
     (speed, "Speed [m/s]", "turbo", "velocity_speed"),
     (p, "Pressure [Pa]", "coolwarm", "pressure_field"),
     (w, "Axial velocity w [m/s]", "bwr", "w_velocity"),
@@ -503,16 +582,20 @@ axes[0, 1].set_title('Oxygen Concentration')
 axes[0, 1].legend()
 axes[0, 1].grid(True, alpha=0.3)
 
-axes[1, 0].plot(time_array, history['max_velocity'], 'orange', linewidth=2)
+axes[1, 0].plot(time_array, history['T_avg'], 'red', label='Average', linewidth=2)
+axes[1, 0].plot(time_array, history['T_max'], 'orange', label='Maximum', linewidth=2)
+axes[1, 0].axhline(y=T_wall, color='blue', linestyle='--', label='Wall Temp')
 axes[1, 0].set_xlabel('Time [s]')
-axes[1, 0].set_ylabel('Max Velocity [m/s]')
-axes[1, 0].set_title('Flow Field Dynamics')
+axes[1, 0].set_ylabel('Temperature [°C]')
+axes[1, 0].set_title('Temperature Evolution')
+axes[1, 0].legend()
 axes[1, 0].grid(True, alpha=0.3)
 
-axes[1, 1].text(0.1, 0.9, f"Reactor: {volume_target:.0f} m3\nN: {N_rpm:.0f} rpm\nT: {T:.0f}C\nP_gas: {P_gas/1e5:.2f} bar", 
-                transform=axes[1, 1].transAxes, fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-axes[1, 1].axis('off')
+axes[1, 1].plot(time_array, history['max_velocity'], 'purple', linewidth=2)
+axes[1, 1].set_xlabel('Time [s]')
+axes[1, 1].set_ylabel('Max Velocity [m/s]')
+axes[1, 1].set_title('Flow Field Dynamics')
+axes[1, 1].grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, "timeseries.png"), dpi=150)
@@ -526,13 +609,14 @@ print(f"Reactor Volume: {volume_target:.1f} m3")
 print(f"Reactor Geometry: D={diameter:.2f}m, H={height:.2f}m")
 print(f"Impeller Configuration: {n_impellers} Rushton turbines @ {N_rpm:.0f} rpm")
 print(f"Aeration: {Q_air:.4f} m3/s ({Q_air/volume_target:.2f} vvm)")
-print(f"Temperature: {T:.0f}C, Pressure: {P_gas/1e5:.2f} bar")
-print(f"O2 Saturation: {henry_saturation(T, P_gas)*1000:.2f} mmol/m3")
+print(f"Temperature: {T_ref:.0f}C, Pressure: {P_gas/1e5:.2f} bar")
+print(f"O2 Saturation: {henry_saturation(T_ref, P_gas)*1000:.2f} mmol/m3")
 print(f"\nResults:")
 print(f"  Simulation Time: {time_array[-1]:.2f} s")
 print(f"  Avg OTR (last 50%): {np.mean(history['OTR'][int(len(history['OTR'])*0.5):]):.2f} mmol/(L*h)")
 print(f"  Max OTR: {np.max(history['OTR']):.2f} mmol/(L*h)")
 print(f"  Final C_O2: {history['C_O2_avg'][-1]*1000:.3f} mmol/m3")
+print(f"  Final T_avg: {history['T_avg'][-1]:.2f}°C (Max: {history['T_max'][-1]:.2f}°C)")
 print(f"  Max Velocity: {np.max(history['max_velocity']):.6f} m/s")
 print(f"\nPlots saved to: {os.path.abspath(output_dir)}")
 print("="*60)
