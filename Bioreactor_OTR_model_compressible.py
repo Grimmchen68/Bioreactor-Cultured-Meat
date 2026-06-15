@@ -22,17 +22,17 @@ np.seterr(over='ignore', invalid='ignore')
 # =========================
 # Physical dimensions
 # =========================
-volume_target = 20.0  # m^3
-height = 3.0  # m
-radius = np.sqrt(volume_target / (np.pi * height))
-diameter = 2.0 * radius
+diameter = 2.516  # m
+height = 1.6 * diameter  # m
+radius = diameter / 2.0
+volume_target = np.pi * radius**2 * height  # m^3
 
 # Reduced grid resolution for faster simulation
 nx, ny, nz = 24, 24, 32
 Lx = Ly = diameter
 Lz = height
 
-n_impellers = 2  # Number of Rushton impellers
+n_impellers = 3  # Number of Rushton impellers
 
 # =========================
 # Bioreactor-specific parameters
@@ -110,10 +110,10 @@ mask = create_stirred_tank(nx, ny, nz, radius, height)
 
 dx = dy = Lx / nx
 dz = Lz / nz
-dt = 0.001  # initial time step (s)
-dt_max = 0.02  # maximum time-step size (s)
-nt = 10000  # safety cap
-t_final = 300.0  # desired simulation duration in seconds
+dt = 0.0005  # initial time step (s)
+dt_max = 0.005  # maximum time-step size (s) - reduced for stability
+nt = 1000000  # safety cap (increased for long simulations)
+t_final = 10  # short verification run (10 s)
 
 mu = 0.005  # Molecular (dynamic) viscosity [Pa·s]
 
@@ -363,35 +363,58 @@ def pressure_poisson(p, u_star, v_star, w_star, rho_field):
     b = divergence_mass(rho_field, u_star, v_star, w_star) / dt
     b[~mask] = 0
 
+    # SOR parameters: use moderate relaxation and controlled iterations
     omega = 1.0
-    tol = 1e-5
+    tol = 1e-6
     coeff = dx**2
+    max_iter = 800
 
-    for _ in range(120):
-        p_old = p[1:-1,1:-1,1:-1].copy()
+    # Work in float64 locally to prevent overflow/precision issues
+    p64 = p.astype(np.float64)
+    b64 = b.astype(np.float64)
+
+    # Diagnostic: check rhs b for NaNs/Infs
+    if np.isnan(b64).any() or np.isinf(b64).any():
+        print("pressure_poisson: b contains NaN/Inf", np.isnan(b64).any(), np.isinf(b64).any())
+    for it in range(max_iter):
+        p_old = p64[1:-1,1:-1,1:-1].copy()
 
         neighbor_sum = (
-            p[2:,1:-1,1:-1] + p[:-2,1:-1,1:-1] +
-            p[1:-1,2:,1:-1] + p[1:-1,:-2,1:-1] +
-            p[1:-1,1:-1,2:] + p[1:-1,1:-1,:-2]
+            p64[2:,1:-1,1:-1] + p64[:-2,1:-1,1:-1] +
+            p64[1:-1,2:,1:-1] + p64[1:-1,:-2,1:-1] +
+            p64[1:-1,1:-1,2:] + p64[1:-1,1:-1,:-2]
         )
 
-        p_new = (neighbor_sum - coeff * b[1:-1,1:-1,1:-1]) / 6.0
+        p_new = (neighbor_sum - coeff * b64[1:-1,1:-1,1:-1]) / 6.0
+        if np.isnan(p_new).any() or np.isinf(p_new).any():
+            print(f"pressure_poisson: p_new has NaN/Inf on iter {it}", np.isnan(p_new).any(), np.isinf(p_new).any())
+            p_new = np.nan_to_num(p_new, nan=0.0, posinf=0.0, neginf=0.0)
+
         p_relaxed = p_old + omega * (p_new - p_old)
+        p64[1:-1,1:-1,1:-1] = p_relaxed
 
-        p[1:-1,1:-1,1:-1][mask_int] = p_relaxed[mask_int]
-        p[~mask] = 0
+        # Enforce solid regions and boundary mirror conditions
+        p64[~mask] = P_atm
+        p64[0,:,:]  = p64[1,:,:]
+        p64[-1,:,:] = p64[-2,:,:]
+        p64[:,0,:]  = p64[:,1,:]
+        p64[:,-1,:] = p64[:,-2,:]
+        p64[:,:,0]  = p64[:,:,1]
+        p64[:,:,-1] = p64[:,:,-2]
 
-        p[0,:,:]  = p[1,:,:]
-        p[-1,:,:] = p[-2,:,:]
-        p[:,0,:]  = p[:,1,:]
-        p[:,-1,:] = p[:,-2,:]
-        p[:,:,0]  = p[:,:,1]
-        p[:,:,-1] = p[:,:,-2]
-
-        if np.max(np.abs(p[1:-1,1:-1,1:-1] - p_old)) < tol:
+        # Check convergence
+        res = np.max(np.abs(p64[1:-1,1:-1,1:-1] - p_old))
+        if res < tol:
             break
 
+    # Sanitize extreme values: clip infinities to a reasonable physical range
+    p_max = P_atm + 0.05 * K_bulk
+    p_min = P_atm - 0.05 * K_bulk
+    p64 = np.nan_to_num(p64, nan=P_atm, posinf=p_max, neginf=p_min)
+    p64 = np.clip(p64, p_min, p_max)
+
+    # Cast back to original dtype
+    p[:] = p64.astype(p.dtype)
     return p
 
 # =========================
@@ -415,8 +438,10 @@ def impeller_force(num_impellers=n_impellers):
     radial_blade_radius = 0.22 * radius
     radial_blade_width = 0.08 * radius
 
-    strength_radial = np.float32(260.0)
-    strength_axial = np.float32(80.0)
+    # Scale factor to reduce impeller forcing for numerical stability
+    strength_scale = 0.01
+    strength_radial = np.float32(260.0 * strength_scale)
+    strength_axial = np.float32(80.0 * strength_scale)
 
     Fx = np.zeros((nx, ny, nz), dtype=np.float32)
     Fy = np.zeros((nx, ny, nz), dtype=np.float32)
@@ -437,7 +462,30 @@ def impeller_force(num_impellers=n_impellers):
         Fy += tangential_y[:, :, None] * weight
         Fz += strength_axial * axial_sign[idx] * weight * radial_profile_3d
 
+    Fx = smooth_force_field(Fx)
+    Fy = smooth_force_field(Fy)
+    Fz = smooth_force_field(Fz)
+
+    Fx[~mask] = 0.0
+    Fy[~mask] = 0.0
+    Fz[~mask] = 0.0
+
     return Fx, Fy, Fz
+
+
+def smooth_force_field(field, iterations=2):
+    """Apply simple 3D smoothing to reduce sharp force gradients."""
+    f = field.astype(np.float32)
+    for _ in range(iterations):
+        f_new = np.zeros_like(f)
+        f_new[1:-1,1:-1,1:-1] = (
+            f[1:-1,1:-1,1:-1] * 4.0 +
+            f[2:,1:-1,1:-1] + f[:-2,1:-1,1:-1] +
+            f[1:-1,2:,1:-1] + f[1:-1,:-2,1:-1] +
+            f[1:-1,1:-1,2:] + f[1:-1,1:-1,:-2]
+        ) / 10.0
+        f = f_new
+    return f
 
 # =========================
 # Baffles and shaft
@@ -532,7 +580,21 @@ def update_k_epsilon_equations(k_field, epsilon_field, u_field, v_field, w_field
     # Avoid production in very low velocity regions
     S_safe = np.maximum(S, 1e-12)
     P_k = mu_field * S_safe**2
-    P_k[~mask_reg] = 0.0
+    # Allow `mask_reg` to be either full-domain or interior-sliced mask
+    if mask_reg.shape != P_k.shape:
+        if mask_reg.shape == P_k[1:-1,1:-1,1:-1].shape:
+            mask_used = np.zeros_like(P_k, dtype=bool)
+            mask_used[1:-1,1:-1,1:-1] = mask_reg
+        else:
+            # Fallback: try to broadcast, otherwise assume full domain
+            try:
+                mask_used = np.broadcast_to(mask_reg, P_k.shape)
+            except Exception:
+                mask_used = np.ones_like(P_k, dtype=bool)
+    else:
+        mask_used = mask_reg
+
+    P_k[~mask_used] = 0.0
     
     # Dissipation rate
     epsilon_safe = np.maximum(epsilon_field, 1e-12)
@@ -566,8 +628,8 @@ def update_k_epsilon_equations(k_field, epsilon_field, u_field, v_field, w_field
     k_new = np.clip(k_new, 0.0, 1000.0)  # Upper limit to prevent numerical issues
     epsilon_new = np.clip(epsilon_new, 1e-15, 1e-3)  # Ensure epsilon stays positive
     
-    k_new[~mask_reg] = 0.0
-    epsilon_new[~mask_reg] = 0.0
+    k_new[~mask_used] = 0.0
+    epsilon_new[~mask_used] = 0.0
     
     return k_new, epsilon_new
 
@@ -632,7 +694,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
     speed = np.sqrt(u**2 + v**2 + w**2)
     max_speed = np.max(speed) + 1e-6
 
-    CFL_target = 0.3
+    CFL_target = 0.1  # lower CFL target for smaller adaptive dt
     dt = CFL_target * dx / max_speed
     dt = min(dt, dt_max)
 
@@ -660,6 +722,11 @@ while time < t_final and t_step < max(nt, est_steps*10):
     u_star = u + dt * (-conv_u + visc_u + Fx/rho)
     v_star = v + dt * (-conv_v + visc_v + Fy/rho)
     w_star = w + dt * (-conv_w + visc_w + Fz/rho)
+
+    # Maintain zero provisional velocity in solid cells before pressure solve
+    u_star[~mask] = 0.0
+    v_star[~mask] = 0.0
+    w_star[~mask] = 0.0
     
     D_O2 = 3e-9
     D_sub = 1e-9  # Substrate diffusivity [m²/s]
@@ -734,12 +801,34 @@ while time < t_final and t_step < max(nt, est_steps*10):
 
     T = T + dt * (-conv_T + diff_T + Q_bio / rho_cp + Q_wall / rho_cp)
 
+    # Diagnostic: check for NaNs/Infs before pressure solve
+    if t_step < 5:
+        for name, arr in [('u_star', u_star), ('v_star', v_star), ('w_star', w_star), ('rho', rho), ('mu_eff', mu_eff), ('k_turb', k_turb), ('epsilon_turb', epsilon_turb)]:
+            try:
+                print(f"{name}: hasNaN={np.isnan(arr).any()}, hasInf={np.isinf(arr).any()}, min={np.nanmin(arr):.3e}, max={np.nanmax(arr):.3e}")
+            except Exception as e:
+                print(f"{name}: diagnostic failed: {e}")
+        div_star = divergence_mass(rho, u_star, v_star, w_star)
+        print(f"div_star: min={np.min(div_star):.3e}, max={np.max(div_star):.3e}, mean={np.mean(div_star):.3e}")
+        b_star = div_star / dt
+        print(f"b_star: min={np.min(b_star):.3e}, max={np.max(b_star):.3e}, mean={np.mean(b_star):.3e}")
     p = pressure_poisson(p, u_star, v_star, w_star, rho)
 
-    u = u_star - dt * ddx(p) / rho
-    v = v_star - dt * ddy(p) / rho
-    w = w_star - dt * ddz(p) / rho
+    du = dt * ddx(p) / rho
+    dv = dt * ddy(p) / rho
+    dw = dt * ddz(p) / rho
+    u = u_star - du
+    v = v_star - dv
+    w = w_star - dw
 
+    if t_step < 5:
+        print(f"pressure correction du: min={np.min(du):.3e}, max={np.max(du):.3e}")
+        print(f"pressure correction dv: min={np.min(dv):.3e}, max={np.max(dv):.3e}")
+        print(f"pressure correction dw: min={np.min(dw):.3e}, max={np.max(dw):.3e}")
+        print(f"u_star: min={np.min(u_star):.3e}, max={np.max(u_star):.3e}")
+        print(f"v_star: min={np.min(v_star):.3e}, max={np.max(v_star):.3e}")
+        print(f"w_star: min={np.min(w_star):.3e}, max={np.max(w_star):.3e}")
+        print(f"p: min={np.min(p):.3e}, max={np.max(p):.3e}")
     # Update density from local pressure using a weakly compressible equation
     # of state. For liquids the bulk modulus is very large, so density changes
     # remain small even for noticeable pressure variations.
@@ -774,7 +863,41 @@ while time < t_final and t_step < max(nt, est_steps*10):
     X_bio = np.clip(X_bio, 0.0, 200.0)  # Upper limit on biomass
     T = np.clip(T, 20.0, 50.0)
 
-    div = np.max(np.abs(divergence_mass(rho, u, v, w)))
+    # Diagnostic: check for NaNs/Infs after pressure update
+    if t_step < 5:
+        for name, arr in [('u', u), ('v', v), ('w', w), ('rho', rho), ('p', p)]:
+            try:
+                print(f"post-p solve {name}: hasNaN={np.isnan(arr).any()}, hasInf={np.isinf(arr).any()}, min={np.nanmin(arr):.3e}, max={np.nanmax(arr):.3e}")
+            except Exception as e:
+                print(f"post-p solve {name}: diagnostic failed: {e}")
+    div_field = divergence_mass(rho, u, v, w)
+    div = np.max(np.abs(div_field))
+    # Diagnostic prints: show shapes and stats for first steps or large divergence
+    if t_step < 5 or div > 0.1:
+        try:
+            # Check divergence of forcing terms (should be small)
+            # Check force per unit mass for NaNs/Infs before differencing
+            force_over_rho = Fx / rho
+            try:
+                hasNa = np.isnan(force_over_rho)
+                print(f"Fx/rho: hasNaN={hasNa.any()}, hasInf={np.isinf(force_over_rho).any()}, min={np.nanmin(force_over_rho):.3e}, max={np.nanmax(force_over_rho):.3e}")
+                if hasNa.any():
+                    idxs = np.argwhere(hasNa)
+                    for ii in idxs[:5]:
+                        i,j,k = ii
+                        print(f"NaN at idx {i,j,k}: Fx={Fx[i,j,k]:.3e}, rho={rho[i,j,k]:.3e}")
+            except Exception as e:
+                print("Fx/rho diagnostic failed:", e)
+            div_force = ddx(force_over_rho) + ddy(Fy / rho) + ddz(Fz / rho)
+            div_Fx = ddx(Fx) + ddy(Fy) + ddz(Fz)
+            print(f"Div(force/rho) stats: min={np.nanmin(div_force):.3e}, max={np.nanmax(div_force):.3e}, mean={np.nanmean(div_force):.3e}")
+            print(f"Div(Fx) stats: min={np.min(div_Fx):.3e}, max={np.max(div_Fx):.3e}, mean={np.mean(div_Fx):.3e}")
+            print(f"STEP {t_step}: dt={dt:.3e}, dt_max={dt_max:.3e}, max_speed={max_speed:.3e}, div_max={div:.3e}")
+            print(f"Shapes: rho={rho.shape}, u={u.shape}, mask={mask.shape}, mask_int={mask_int.shape}, mu_eff={mu_eff.shape}")
+            print(f"Div stats: min={np.min(div_field):.3e}, max={np.max(div_field):.3e}, mean={np.mean(div_field):.3e}")
+            print(f"k_turb stats: min={np.min(k_turb):.3e}, max={np.max(k_turb):.3e}")
+        except Exception as e:
+            print("Diagnostic print failed:", e)
     speed = np.sqrt(u**2 + v**2 + w**2)
     max_speed = np.max(speed) + 1e-6
 
