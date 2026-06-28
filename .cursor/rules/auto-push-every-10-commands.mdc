@@ -1,0 +1,26 @@
+---
+description: Auto-push to GitHub after every 10 user commands
+alwaysApply: true
+---
+
+# Auto-push every 10 commands
+
+This project auto-pushes to `origin/main` after every **10 user prompts** via `.cursor/hooks/auto_push.py`.
+
+## Agent behavior
+
+- **Never commit.** Commits are made only by **katharina-brenner** manually (see rule `git-commits-by-user-only`).
+- Do **not** push manually on every turn; the hook pushes automatically on every 10th completed command **if the user has already committed locally**.
+- If the user explicitly asks to push, push right away regardless of the counter.
+- After a manual push, mention that the auto-push counter still increments in the background.
+
+## Counter and logs
+
+- Counter file: `.cursor/command_counter.json` (local only, gitignored)
+- Push log: `.cursor/auto_push.log`
+- Remote: `https://github.com/Grimmchen68/Bioreactor-Cultured-Meat`
+
+## Hook workflow (every agent turn end)
+
+1. Increment command counter
+2. On multiples of 10: `git fetch`, `git pull --rebase origin main`, then `git push origin main` if local commits exist

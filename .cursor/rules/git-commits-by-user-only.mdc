@@ -1,0 +1,28 @@
+---
+description: Commits only by katharina-brenner — never by the agent
+alwaysApply: true
+---
+
+# Git commits: user only (katharina-brenner)
+
+**The agent must NEVER run `git commit`, `git commit --amend`, or create commits on behalf of the user.**
+
+All commits are made manually by **katharina-brenner** in the terminal or Git UI.
+
+## Agent behavior
+
+- Do **not** commit changes, even when the user says "save to git" or "publish" — instead prepare changes and give clear `git add` / `git commit` instructions for the user.
+- Do **not** push unless the user explicitly asks to push in that message.
+- After code changes, summarize what changed and which files the user should stage — do not commit for them.
+- If the user asks to "commit", respond with the exact commands they should run locally (so authorship stays under their Git identity).
+
+## User identity
+
+Commits on this repo should appear as **katharina-brenner** on GitHub, not as Cursor Agent or any automated author.
+
+The user configures their identity locally (agent does not change `git config`):
+
+```powershell
+git config --local user.name "katharina-brenner"
+git config --local user.email "<your-github-email>"
+```

@@ -4,5 +4,7 @@ results/
 CFD_3D_pyvista.png
 Figure_*.png
 
-# IDE
+# IDE / Cursor session state
 .vscode/
+.cursor/command_counter.json
+.cursor/auto_push.log

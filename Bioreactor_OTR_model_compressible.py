@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse import lil_matrix, csr_matrix
@@ -843,6 +844,7 @@ def update_k_epsilon_equations(
     """
     rho_safe = np.maximum(rho_field.astype(np.float64), 1e-8)
     k_safe = np.maximum(k_field, 1e-12)
+    epsilon_safe = np.maximum(epsilon_field, 1e-12)
 
     phi, _ = compute_low_mach_preconditioner(
         u_field, v_field, w_field, k_field, rho_field
@@ -1391,6 +1393,13 @@ PLOT_STYLE = {
 }
 TIME_LABEL = "Simulation time t [s]"
 
+FIELDS_DIR = os.path.join(OUTPUT_DIR, "fields")
+PROFILES_DIR = os.path.join(OUTPUT_DIR, "profiles")
+TIMESERIES_DIR = os.path.join(OUTPUT_DIR, "timeseries")
+OTR_DIR = os.path.join(OUTPUT_DIR, "otr")
+for _plot_dir in (FIELDS_DIR, PROFILES_DIR, TIMESERIES_DIR, OTR_DIR):
+    os.makedirs(_plot_dir, exist_ok=True)
+
 
 def masked_field(field):
     """Return field with solid/non-liquid cells set to NaN for plotting."""
@@ -1401,6 +1410,7 @@ def masked_field(field):
 
 def save_figure(fig, filename):
     path = os.path.join(OUTPUT_DIR, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return path
@@ -1421,11 +1431,79 @@ def plot_scalar_map(ax, field, extent, title, cbar_label, cmap):
     return im
 
 
-# Final spatial fields at end of simulation
+def plot_contour_map(ax, field, extent, title, cbar_label, cmap):
+    x_grid = np.linspace(extent[0], extent[1], field.shape[0])
+    z_grid = np.linspace(extent[2], extent[3], field.shape[1])
+    xx, zz = np.meshgrid(x_grid, z_grid, indexing="ij")
+    cf = ax.contourf(xx.T, zz.T, field.T, levels=20, cmap=cmap)
+    cbar = plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label)
+    ax.set_title(title)
+    return cf
+
+
+def volume_mean_along_z(field):
+    profile = np.full(nz, np.nan, dtype=np.float64)
+    for k in range(nz):
+        layer = mask[:, :, k]
+        if layer.any():
+            profile[k] = np.mean(field[:, :, k][layer])
+    return profile
+
+
+def volume_mean_along_r(field, j_index):
+    profile = np.full(nx, np.nan, dtype=np.float64)
+    for i in range(nx):
+        column = mask[i, j_index, :]
+        if column.any():
+            profile[i] = np.mean(field[i, j_index, :][column])
+    return profile
+
+
+# --- Final 3D scalar fields ---
 C_sat_final = henry_saturation(T, P_gas)
-kLa_final = update_kLa_field(N_rpm, len(history["time"]))
+kLa_final = update_kLa_field(N_rpm)
 OTR_field = oxygen_transfer_rate(C_O2, C_sat_final, kLa_final)
+O2_driving_force = np.maximum(C_sat_final - C_O2, 0.0)
+_, _, OUR_field = growth_kinetics(C_O2, C_sub, X_bio, T)
+OUR_field = np.maximum(OUR_field, 0.0)
+mu_t_final = compute_turbulent_viscosity(k_turb, epsilon_turb, rho, u, v, w)
 speed_field = np.sqrt(u ** 2 + v ** 2 + w ** 2)
+
+SCALAR_CATALOG = [
+    ("biomass", X_bio, "Biomass concentration X [g/L]", "YlGn"),
+    ("substrate", C_sub, "Substrate concentration S [g/L]", "Purples"),
+    ("dissolved_o2", C_O2, "Dissolved O₂ concentration C_O₂ [mol/m³]", "plasma"),
+    ("temperature", T, "Liquid temperature T [°C]", "inferno"),
+    ("local_otr", OTR_field, "Local OTR [mol/(m³·s)]", "Blues"),
+    ("kla", kLa_final, "Volumetric mass-transfer coefficient k_L a [1/s]", "GnBu"),
+    ("o2_saturation", C_sat_final, "O₂ saturation C* [mol/m³]", "cividis"),
+    ("o2_driving_force", O2_driving_force, "O₂ driving force (C* − C_O₂) [mol/m³]", "YlOrRd"),
+    ("our", OUR_field, "Oxygen uptake rate OUR [mol/(m³·s)]", "OrRd"),
+    ("flow_speed", speed_field, "Flow speed |u| [m/s]", "turbo"),
+    ("velocity_u", u, "Axial velocity u [m/s]", "RdBu_r"),
+    ("velocity_v", v, "Radial velocity v [m/s]", "RdBu_r"),
+    ("velocity_w", w, "Vertical velocity w [m/s]", "RdBu_r"),
+    ("pressure", p, "Pressure p [Pa]", "coolwarm"),
+    ("density", rho, "Density ρ [kg/m³]", "viridis"),
+    ("turbulent_k", k_turb, "Turbulent kinetic energy k [m²/s²]", "magma"),
+    ("turbulent_epsilon", epsilon_turb, "Turbulent dissipation ε [m²/s³]", "magma_r"),
+    ("turbulent_viscosity", mu_t_final, "Turbulent viscosity μ_t [Pa·s]", "cividis"),
+]
+
+TIMESERIES_CATALOG = [
+    ("liquid_volume", "volume", "Liquid volume V [L]", "tab:blue", False),
+    ("biomass", "X_bio_avg", "Biomass concentration X [g/L]", "tab:green", True),
+    ("substrate", "C_sub_avg", "Substrate concentration S [g/L]", "tab:purple", True),
+    ("dissolved_o2", "C_O2_avg", "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange", True),
+    ("temperature", "T_avg", "Liquid temperature T [°C]", "tab:red", True),
+    ("total_otr", "OTR", "Total OTR [mol/s]", "tab:blue", False),
+    ("density", "rho_avg", "Density ρ [kg/m³]", "tab:gray", False),
+    ("flow_speed", "max_velocity", "Maximum flow speed |u| [m/s]", "tab:olive", False),
+    ("turbulent_k", "k_turb_avg", "Turbulent kinetic energy k [m²/s²]", "tab:brown", True),
+    ("turbulent_epsilon", "epsilon_turb_avg", "Turbulent dissipation ε [m²/s³]", "tab:pink", True),
+    ("turbulent_viscosity", "mu_t_avg", "Turbulent viscosity μ_t [Pa·s]", "tab:cyan", False),
+]
 
 np.savez(
     os.path.join(OUTPUT_DIR, "final_fields.npz"),
@@ -1438,6 +1516,9 @@ np.savez(
     C_O2=C_O2,
     T=T,
     OTR_local=OTR_field,
+    O2_saturation=C_sat_final,
+    O2_driving_force=O2_driving_force,
+    OUR=OUR_field,
     kLa=kLa_final,
     speed=speed_field,
     u=u,
@@ -1445,6 +1526,9 @@ np.savez(
     w=w,
     p=p,
     rho=rho,
+    k_turb=k_turb,
+    epsilon_turb=epsilon_turb,
+    mu_t=mu_t_final,
     history_time=np.array(history["time"]),
     history_OTR=np.array(history["OTR"]),
 )
@@ -1454,17 +1538,202 @@ k_mid = nz // 2
 j_mid = ny // 2
 extent_xz = [x_coords[0], x_coords[-1], z_coords[0], z_coords[-1]]
 extent_xy = [x_coords[0], x_coords[-1], y_coords[0], y_coords[-1]]
+extent_yz = [y_coords[0], y_coords[-1], z_coords[0], z_coords[-1]]
+impeller_z_indices = [int(0.30 * nz), int(0.50 * nz), int(0.65 * nz)]
 
 with plt.rc_context(PLOT_STYLE):
-    # --- Figure 1: vertical mid-plane maps (x-z through reactor center) ---
+    # --- Individual spatial PNG per scalar (3 orthogonal slices) ---
+    for slug, field, label, cmap in SCALAR_CATALOG:
+        data_xz = masked_field(field)[:, j_mid, :]
+        data_xy = masked_field(field)[:, :, k_mid]
+        data_yz = masked_field(field)[i_center, :, :]
+
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+        fig.suptitle(
+            f"{label}  |  t = {time:.1f} s  |  3D bioreactor field",
+            fontsize=12,
+            y=1.03,
+        )
+        slices = [
+            (axes[0], data_xz, extent_xz, "Vertical slice (x–z)", "Radial position x [m]", "Axial position z [m]"),
+            (axes[1], data_xy, extent_xy, f"Horizontal slice (x–y) at z = {z_coords[k_mid]:.2f} m", "Radial position x [m]", "Radial position y [m]"),
+            (axes[2], data_yz, extent_yz, "Vertical slice (y–z)", "Radial position y [m]", "Axial position z [m]"),
+        ]
+        for ax, data, extent, title, xlabel, ylabel in slices:
+            plot_scalar_map(ax, data, extent, title, label, cmap)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+        save_figure(fig, os.path.join("fields", f"{slug}_3d_slices.png"))
+
+        fig_contour, ax_c = plt.subplots(figsize=(7, 5))
+        plot_contour_map(
+            ax_c,
+            data_xz,
+            extent_xz,
+            f"{label} — filled contours (x–z mid-plane)",
+            label,
+            cmap,
+        )
+        ax_c.set_xlabel("Radial position x [m]")
+        ax_c.set_ylabel("Axial position z [m]")
+        save_figure(fig_contour, os.path.join("fields", f"{slug}_contour_xz.png"))
+
+    # --- Axial volume-mean profiles for all biological / OTR scalars ---
+    axial_keys = [
+        ("biomass", X_bio, "Biomass concentration X [g/L]", "tab:green"),
+        ("substrate", C_sub, "Substrate concentration S [g/L]", "tab:purple"),
+        ("dissolved_o2", C_O2, "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange"),
+        ("temperature", T, "Liquid temperature T [°C]", "tab:red"),
+        ("local_otr", OTR_field, "Local OTR [mol/(m³·s)]", "tab:blue"),
+        ("our", OUR_field, "Oxygen uptake rate OUR [mol/(m³·s)]", "tab:olive"),
+        ("kla", kLa_final, "k_L a [1/s]", "tab:cyan"),
+        ("o2_driving_force", O2_driving_force, "O₂ driving force (C* − C_O₂) [mol/m³]", "tab:gray"),
+    ]
+    fig_axial_all, axes_ax = plt.subplots(2, 4, figsize=(16, 8))
+    fig_axial_all.suptitle("Volume-averaged axial profiles (liquid phase only)", fontsize=12, y=1.02)
+    for ax, (slug, field, ylabel, color) in zip(axes_ax.ravel(), axial_keys):
+        profile = volume_mean_along_z(field)
+        ax.plot(z_coords, profile, color=color, linewidth=2)
+        ax.set_xlabel("Axial position z [m]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel.split("[")[0].strip())
+    save_figure(fig_axial_all, os.path.join("profiles", "axial_volume_mean_all_parameters.png"))
+
+    for slug, field, ylabel, color in axial_keys:
+        fig_p, ax_p = plt.subplots(figsize=(7, 4.5))
+        ax_p.plot(z_coords, volume_mean_along_z(field), color=color, linewidth=2)
+        ax_p.set_xlabel("Axial position z [m]")
+        ax_p.set_ylabel(ylabel)
+        ax_p.set_title(f"Volume-averaged axial profile — {ylabel.split('[')[0].strip()}")
+        save_figure(fig_p, os.path.join("profiles", f"{slug}_axial_volume_mean.png"))
+
+    # --- Radial profiles at three impeller heights ---
+    fig_radial_heights, axes_rh = plt.subplots(3, 4, figsize=(16, 11))
+    fig_radial_heights.suptitle("Radial profiles at three axial heights", fontsize=12, y=1.01)
+    radial_keys = axial_keys[:4]
+    for row, k_idx in enumerate(impeller_z_indices):
+        r_line = R_coords[:, j_center, k_idx]
+        for col, (slug, field, ylabel, color) in enumerate(radial_keys):
+            ax = axes_rh[row, col]
+            valid = mask[:, j_center, k_idx]
+            ax.plot(r_line[valid], field[:, j_center, k_idx][valid], color=color, linewidth=2)
+            ax.set_xlabel("Radial distance r [m]")
+            if col == 0:
+                ax.set_ylabel(f"z = {z_coords[k_idx]:.2f} m\n{ylabel.split('[')[0].strip()}")
+            ax.set_title(ylabel.split("[")[0].strip())
+    save_figure(fig_radial_heights, os.path.join("profiles", "radial_profiles_three_heights.png"))
+
+    # --- OTR analysis suite ---
+    OTR_vol_vs_z = np.array([
+        np.sum(OTR_field[:, :, k][mask[:, :, k]]) * dx * dy
+        if mask[:, :, k].any() else 0.0
+        for k in range(nz)
+    ])
+    OUR_vol_vs_z = np.array([
+        np.sum(OUR_field[:, :, k][mask[:, :, k]]) * dx * dy
+        if mask[:, :, k].any() else 0.0
+        for k in range(nz)
+    ])
+
+    fig_otr, axes_otr = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_otr.suptitle("Oxygen transfer analysis in 3D bioreactor", fontsize=12, y=1.02)
+
+    plot_scalar_map(
+        axes_otr[0, 0],
+        masked_field(OTR_field)[:, j_mid, :],
+        extent_xz,
+        "Local OTR (x–z)",
+        "Local OTR [mol/(m³·s)]",
+        "Blues",
+    )
+    axes_otr[0, 0].set_xlabel("Radial position x [m]")
+    axes_otr[0, 0].set_ylabel("Axial position z [m]")
+
+    plot_scalar_map(
+        axes_otr[0, 1],
+        masked_field(kLa_final)[:, j_mid, :],
+        extent_xz,
+        "k_L a field (x–z)",
+        "k_L a [1/s]",
+        "GnBu",
+    )
+    axes_otr[0, 1].set_xlabel("Radial position x [m]")
+    axes_otr[0, 1].set_ylabel("Axial position z [m]")
+
+    plot_scalar_map(
+        axes_otr[0, 2],
+        masked_field(O2_driving_force)[:, j_mid, :],
+        extent_xz,
+        "O₂ driving force (x–z)",
+        "C* − C_O₂ [mol/m³]",
+        "YlOrRd",
+    )
+    axes_otr[0, 2].set_xlabel("Radial position x [m]")
+    axes_otr[0, 2].set_ylabel("Axial position z [m]")
+
+    axes_otr[1, 0].plot(z_coords, OTR_vol_vs_z, color="tab:blue", linewidth=2, label="OTR slab integral")
+    axes_otr[1, 0].plot(z_coords, OUR_vol_vs_z, color="tab:orange", linewidth=2, linestyle="--", label="OUR slab integral")
+    axes_otr[1, 0].set_xlabel("Axial position z [m]")
+    axes_otr[1, 0].set_ylabel("Rate [mol/s per horizontal slab]")
+    axes_otr[1, 0].set_title("Axially resolved OTR vs OUR")
+    axes_otr[1, 0].legend(frameon=False)
+
+    axes_otr[1, 1].plot(history["time"], history["OTR"], color="tab:blue", linewidth=2)
+    axes_otr[1, 1].set_xlabel(TIME_LABEL)
+    axes_otr[1, 1].set_ylabel("Total OTR [mol/s]")
+    axes_otr[1, 1].set_title("Transient total OTR")
+
+    otr_mmol_L_h = np.array(history["OTR"]) * 3600.0 / max(volume_liquid_m3, 1e-12) * 1000.0
+    axes_otr[1, 2].plot(history["time"], otr_mmol_L_h, color="tab:green", linewidth=2)
+    axes_otr[1, 2].set_xlabel(TIME_LABEL)
+    axes_otr[1, 2].set_ylabel("OTR [mmol/(L·h)]")
+    axes_otr[1, 2].set_title("Volumetric OTR (reactor average)")
+
+    save_figure(fig_otr, os.path.join("otr", "otr_analysis_dashboard.png"))
+
+    for otr_name, otr_file, field, label, cmap in [
+        ("local_otr", "local_otr_xz", OTR_field, "Local OTR [mol/(m³·s)]", "Blues"),
+        ("kla", "kla_xz", kLa_final, "k_L a [1/s]", "GnBu"),
+        ("o2_driving_force", "o2_driving_force_xz", O2_driving_force, "C* − C_O₂ [mol/m³]", "YlOrRd"),
+        ("our", "our_xz", OUR_field, "OUR [mol/(m³·s)]", "OrRd"),
+    ]:
+        fig_o, ax_o = plt.subplots(figsize=(7, 5))
+        plot_scalar_map(ax_o, masked_field(field)[:, j_mid, :], extent_xz, label, label, cmap)
+        ax_o.set_xlabel("Radial position x [m]")
+        ax_o.set_ylabel("Axial position z [m]")
+        save_figure(fig_o, os.path.join("otr", f"{otr_file}.png"))
+
+    fig_otr_z, ax_otr_z = plt.subplots(figsize=(7, 4.5))
+    ax_otr_z.plot(z_coords, OTR_vol_vs_z, color="tab:blue", linewidth=2)
+    ax_otr_z.set_xlabel("Axial position z [m]")
+    ax_otr_z.set_ylabel("Slab-integrated OTR [mol/s]")
+    ax_otr_z.set_title("OTR distribution along reactor height")
+    save_figure(fig_otr_z, os.path.join("otr", "otr_axial_integral.png"))
+
+    # --- Individual time-series PNG per tracked parameter ---
+    for slug, hist_key, ylabel, color, show_max in TIMESERIES_CATALOG:
+        fig_t, ax_t = plt.subplots(figsize=(7, 4.5))
+        ax_t.plot(history["time"], history[hist_key], color=color, linewidth=2, label="Volume average")
+        if show_max:
+            max_key = hist_key.replace("_avg", "_max")
+            if max_key in history:
+                ax_t.plot(history["time"], history[max_key], color=color, linestyle="--", linewidth=1.5, label="Spatial maximum")
+        ax_t.set_xlabel(TIME_LABEL)
+        ax_t.set_ylabel(ylabel)
+        ax_t.set_title(f"Transient response — {ylabel.split('[')[0].strip()}")
+        if show_max:
+            ax_t.legend(frameon=False)
+        save_figure(fig_t, os.path.join("timeseries", f"{slug}_vs_time.png"))
+
+    # --- Combined dashboards (overview figures) ---
     fig_maps, axes_maps = plt.subplots(2, 3, figsize=(15, 8.5))
     fig_maps.suptitle(
-        f"Spatial state fields at t = {time:.2f} s  |  "
+        f"Biological & transport fields at t = {time:.1f} s  |  "
         f"D = {diameter:.2f} m, H = {height:.2f} m, {n_impellers} impellers @ {N_rpm:.0f} rpm",
         fontsize=12,
         y=1.02,
     )
-    spatial_maps = [
+    overview_maps = [
         (masked_field(X_bio)[:, j_mid, :], "Biomass concentration X [g/L]", "YlGn"),
         (masked_field(C_sub)[:, j_mid, :], "Substrate concentration S [g/L]", "Purples"),
         (masked_field(C_O2)[:, j_mid, :], "Dissolved O₂ concentration C_O₂ [mol/m³]", "plasma"),
@@ -1472,139 +1741,46 @@ with plt.rc_context(PLOT_STYLE):
         (masked_field(OTR_field)[:, j_mid, :], "Local OTR [mol/(m³·s)]", "Blues"),
         (masked_field(speed_field)[:, j_mid, :], "Flow speed |u| [m/s]", "turbo"),
     ]
-    for ax, (data, cbar_label, cmap) in zip(axes_maps.ravel(), spatial_maps):
-        plot_scalar_map(
-            ax,
-            data,
-            extent_xz,
-            title=cbar_label.split("[")[0].strip(),
-            cbar_label=cbar_label,
-            cmap=cmap,
-        )
+    for ax, (data, cbar_label, cmap) in zip(axes_maps.ravel(), overview_maps):
+        plot_scalar_map(ax, data, extent_xz, cbar_label.split("[")[0].strip(), cbar_label, cmap)
         ax.set_xlabel("Radial position x [m]")
         ax.set_ylabel("Axial position z [m]")
     save_figure(fig_maps, "spatial_fields_xz_midplane.png")
 
-    # --- Figure 2: horizontal mid-height maps (x-y at impeller mid-plane) ---
-    fig_xy, axes_xy = plt.subplots(2, 3, figsize=(15, 8.5))
-    fig_xy.suptitle(
-        f"Horizontal slice at z = {z_coords[k_mid]:.2f} m (mid liquid height)",
-        fontsize=12,
-        y=1.02,
-    )
-    horizontal_maps = [
-        (masked_field(X_bio)[:, :, k_mid], "Biomass concentration X [g/L]", "YlGn"),
-        (masked_field(C_sub)[:, :, k_mid], "Substrate concentration S [g/L]", "Purples"),
-        (masked_field(C_O2)[:, :, k_mid], "Dissolved O₂ concentration C_O₂ [mol/m³]", "plasma"),
-        (masked_field(T)[:, :, k_mid], "Liquid temperature T [°C]", "inferno"),
-        (masked_field(OTR_field)[:, :, k_mid], "Local OTR [mol/(m³·s)]", "Blues"),
-        (masked_field(speed_field)[:, :, k_mid], "Flow speed |u| [m/s]", "turbo"),
-    ]
-    for ax, (data, cbar_label, cmap) in zip(axes_xy.ravel(), horizontal_maps):
-        plot_scalar_map(
-            ax,
-            data,
-            extent_xy,
-            title=cbar_label.split("[")[0].strip(),
-            cbar_label=cbar_label,
-            cmap=cmap,
-        )
-        ax.set_xlabel("Radial position x [m]")
-        ax.set_ylabel("Radial position y [m]")
-    save_figure(fig_xy, "spatial_fields_xy_midheight.png")
-
-    # --- Figure 3: axial profiles along reactor centerline ---
-    fig_axial, axes_axial = plt.subplots(2, 3, figsize=(15, 8.5))
-    fig_axial.suptitle("Axial profiles along centerline (x = 0, y = 0)", fontsize=12, y=1.02)
-    center_profiles = [
-        (X_bio[i_center, j_center, :], "Biomass concentration X [g/L]", "tab:green"),
-        (C_sub[i_center, j_center, :], "Substrate concentration S [g/L]", "tab:purple"),
-        (C_O2[i_center, j_center, :], "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange"),
-        (T[i_center, j_center, :], "Liquid temperature T [°C]", "tab:red"),
-        (OTR_field[i_center, j_center, :], "Local OTR [mol/(m³·s)]", "tab:blue"),
-        (speed_field[i_center, j_center, :], "Flow speed |u| [m/s]", "tab:gray"),
-    ]
-    for ax, (values, ylabel, color) in zip(axes_axial.ravel(), center_profiles):
-        valid = mask[i_center, j_center, :]
-        ax.plot(z_coords[valid], values[valid], color=color, linewidth=2)
-        ax.set_xlabel("Axial position z [m]")
-        ax.set_ylabel(ylabel)
-        ax.set_title(ylabel.split("[")[0].strip())
-    save_figure(fig_axial, "axial_profiles_centerline.png")
-
-    # --- Figure 4: radial profiles at impeller-relevant heights ---
-    impeller_z_indices = [int(0.30 * nz), int(0.50 * nz), int(0.65 * nz)]
-    fig_radial, axes_radial = plt.subplots(2, 3, figsize=(15, 8.5))
-    fig_radial.suptitle(
-        "Radial profiles at mid impeller height "
-        f"(z = {z_coords[impeller_z_indices[1]]:.2f} m)",
-        fontsize=12,
-        y=1.02,
-    )
-    k_imp = impeller_z_indices[1]
-    r_line = R_coords[:, j_center, k_imp]
-    radial_profiles = [
-        (X_bio[:, j_center, k_imp], "Biomass concentration X [g/L]", "tab:green"),
-        (C_sub[:, j_center, k_imp], "Substrate concentration S [g/L]", "tab:purple"),
-        (C_O2[:, j_center, k_imp], "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange"),
-        (T[:, j_center, k_imp], "Liquid temperature T [°C]", "tab:red"),
-        (OTR_field[:, j_center, k_imp], "Local OTR [mol/(m³·s)]", "tab:blue"),
-        (speed_field[:, j_center, k_imp], "Flow speed |u| [m/s]", "tab:gray"),
-    ]
-    for ax, (values, ylabel, color) in zip(axes_radial.ravel(), radial_profiles):
-        valid = mask[:, j_center, k_imp]
-        ax.plot(r_line[valid], values[valid], color=color, linewidth=2)
-        ax.set_xlabel("Radial distance r [m]")
-        ax.set_ylabel(ylabel)
-        ax.set_title(ylabel.split("[")[0].strip())
-    save_figure(fig_radial, "radial_profiles_impeller_height.png")
-
-    # --- Figure 5: integrated time-series dashboard ---
     fig_ts, axes_ts = plt.subplots(2, 3, figsize=(15, 8.5))
     fig_ts.suptitle(
         f"Transient reactor response  |  fed-batch strategy: {fed_batch_strategy}",
         fontsize=12,
         y=1.02,
     )
-
     axes_ts[0, 0].plot(history["time"], history["volume"], color="tab:blue", linewidth=2)
     axes_ts[0, 0].set_xlabel(TIME_LABEL)
     axes_ts[0, 0].set_ylabel("Liquid volume V [L]")
     axes_ts[0, 0].set_title("Fed-batch liquid volume")
-
     axes_ts[0, 1].plot(history["time"], history["X_bio_avg"], color="tab:green", linewidth=2, label="Volume average")
     axes_ts[0, 1].plot(history["time"], history["X_bio_max"], color="tab:green", linestyle="--", linewidth=1.5, label="Spatial maximum")
     axes_ts[0, 1].set_xlabel(TIME_LABEL)
     axes_ts[0, 1].set_ylabel("Biomass concentration X [g/L]")
-    axes_ts[0, 1].set_title("Biomass concentration")
     axes_ts[0, 1].legend(frameon=False)
-
     axes_ts[0, 2].plot(history["time"], history["C_sub_avg"], color="tab:purple", linewidth=2, label="Volume average")
     axes_ts[0, 2].plot(history["time"], history["C_sub_max"], color="tab:purple", linestyle="--", linewidth=1.5, label="Spatial maximum")
     axes_ts[0, 2].set_xlabel(TIME_LABEL)
     axes_ts[0, 2].set_ylabel("Substrate concentration S [g/L]")
-    axes_ts[0, 2].set_title("Substrate concentration")
     axes_ts[0, 2].legend(frameon=False)
-
     axes_ts[1, 0].plot(history["time"], history["C_O2_avg"], color="tab:orange", linewidth=2, label="Volume average")
     axes_ts[1, 0].plot(history["time"], history["C_O2_max"], color="tab:orange", linestyle="--", linewidth=1.5, label="Spatial maximum")
     axes_ts[1, 0].set_xlabel(TIME_LABEL)
     axes_ts[1, 0].set_ylabel("Dissolved O₂ concentration C_O₂ [mol/m³]")
-    axes_ts[1, 0].set_title("Dissolved oxygen")
     axes_ts[1, 0].legend(frameon=False)
-
     axes_ts[1, 1].plot(history["time"], history["T_avg"], color="tab:red", linewidth=2, label="Volume average")
     axes_ts[1, 1].plot(history["time"], history["T_max"], color="tab:red", linestyle="--", linewidth=1.5, label="Spatial maximum")
     axes_ts[1, 1].set_xlabel(TIME_LABEL)
     axes_ts[1, 1].set_ylabel("Liquid temperature T [°C]")
-    axes_ts[1, 1].set_title("Liquid temperature")
     axes_ts[1, 1].legend(frameon=False)
-
     axes_ts[1, 2].plot(history["time"], history["OTR"], color="tab:blue", linewidth=2)
     axes_ts[1, 2].set_xlabel(TIME_LABEL)
     axes_ts[1, 2].set_ylabel("Total OTR [mol/s]")
     axes_ts[1, 2].set_title("Oxygen transfer rate (volume integral)")
-
     save_figure(fig_ts, "transient_timeseries.png")
 
 summary_path = os.path.join(OUTPUT_DIR, "simulation_summary.txt")
@@ -1623,17 +1799,23 @@ with open(summary_path, "w", encoding="utf-8") as summary_file:
     summary_file.write(f"Volume-averaged temperature T: {np.mean(T[mask]):.3f} C\n")
     summary_file.write(f"Total OTR (final step): {history['OTR'][-1]:.4e} mol/s\n")
     summary_file.write(f"Peak local OTR: {np.max(OTR_field[mask]):.4e} mol/(m^3 s)\n")
+    summary_file.write(f"Peak OUR: {np.max(OUR_field[mask]):.4e} mol/(m^3 s)\n")
     summary_file.write(f"Peak flow speed: {np.max(speed_field[mask]):.4f} m/s\n")
+    summary_file.write("\nOutput folders:\n")
+    summary_file.write(f"  fields/       — per-parameter 3D slice PNGs ({len(SCALAR_CATALOG)} scalars)\n")
+    summary_file.write(f"  profiles/     — axial and radial profile PNGs\n")
+    summary_file.write(f"  timeseries/   — transient PNGs ({len(TIMESERIES_CATALOG)} signals)\n")
+    summary_file.write(f"  otr/          — OTR-specific analysis PNGs\n")
 
-print(f"\nSpatial outputs saved to: {os.path.abspath(OUTPUT_DIR)}")
-print(f"  - spatial_fields_xz_midplane.png")
-print(f"  - spatial_fields_xy_midheight.png")
-print(f"  - axial_profiles_centerline.png")
-print(f"  - radial_profiles_impeller_height.png")
-print(f"  - transient_timeseries.png")
-print(f"  - final_fields.npz")
-print(f"  - simulation_summary.txt")
+print(f"\nAll outputs saved to: {os.path.abspath(OUTPUT_DIR)}")
+print(f"  fields/       — {len(SCALAR_CATALOG)} parameters x (3-slice + contour PNGs)")
+print(f"  profiles/     — axial & radial profile sets")
+print(f"  timeseries/   — {len(TIMESERIES_CATALOG)} transient PNGs")
+print(f"  otr/          — OTR / kLa / driving-force / OUR analysis")
+print(f"  spatial_fields_xz_midplane.png, transient_timeseries.png")
+print(f"  final_fields.npz, simulation_summary.txt")
 
 plt.show()
+
 
 
