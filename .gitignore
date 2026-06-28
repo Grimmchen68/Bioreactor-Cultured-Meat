@@ -1,0 +1,8 @@
+# Generated simulation outputs
+results/
+*.npz
+CFD_3D_pyvista.png
+Figure_*.png
+
+# IDE
+.vscode/

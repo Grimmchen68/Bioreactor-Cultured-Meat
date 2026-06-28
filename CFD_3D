@@ -229,7 +229,7 @@ for t in range(nt):
     
     # Divergence check
     if np.isnan(div) or np.isinf(div) or div > 1.0:
-        print(f"⚠️ DIVERGENT at step {t}: div={div:.2e}")
+        print(f"WARNING: DIVERGENT at step {t}: div={div:.2e}")
         print(f"Max velocity: {max_speed:.4f}, Max speed allowed: {max_velocity_allowed}")
         print(f"CFL: {CFL:.4f}")
         break
@@ -297,9 +297,9 @@ try:
         integration_direction='forward'
     )
     plotter.add_mesh(streamlines, color="blue", label="Streamlines", opacity=0.8)
-    print("✓ Streamlines hinzugefügt")
+    print("OK: Streamlines hinzugefuegt")
 except Exception as e:
-    print(f"⚠ Streamlines: {e}")
+    print(f"WARN: Streamlines: {e}")
 
 # Camera
 plotter.camera_position = 'iso'
@@ -313,12 +313,12 @@ plotter.add_title('CFD 3D Bioreactor Streamingsimulation', color='green',
                    font_size=14)
 
 # Zeige interaktives Fenster
-print("🌐 Öffne interaktives 3D-Fenster...")
+print("Oeffne interaktives 3D-Fenster...")
 print("   Bedienung: Linke Maustaste = drehen, Scroll = zoomen, Rechte Maustaste = verschieben")
 
 plotter.show()
 
-print("✓ Fenster geschlossen")
+print("OK: Fenster geschlossen")
 
 # Versuche Screenshot zu speichern (funktioniert nach show)
 try:
@@ -326,13 +326,13 @@ try:
     import time
     time.sleep(0.5)
     image = plotter.screenshot('CFD_3D_pyvista.png')
-    print("✓ Screenshot gespeichert: CFD_3D_pyvista.png")
+    print("OK: Screenshot gespeichert: CFD_3D_pyvista.png")
 except Exception as e:
-    print(f"⚠ Screenshot konnte nicht gespeichert werden: {e}")
+    print(f"WARN: Screenshot konnte nicht gespeichert werden: {e}")
 
 # Rohdaten
 np.savez('CFD_3D_data.npz',
          u=u, v=v, w=w, p=p, mask=mask,
          nx=nx, ny=ny, nz=nz, dt=dt, mu=mu, rho=rho)
-print("✓ Rohdaten gespeichert: CFD_3D_data.npz")
-print("\n✅ CFD 3D Visualisierung erfolgreich abgeschlossen!")
+print("OK: Rohdaten gespeichert: CFD_3D_data.npz")
+print("\nCFD 3D Visualisierung erfolgreich abgeschlossen!")

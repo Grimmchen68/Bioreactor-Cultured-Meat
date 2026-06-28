@@ -110,6 +110,14 @@ mask = create_stirred_tank(nx, ny, nz, radius, height)
 
 dx = dy = Lx / nx
 dz = Lz / nz
+x_coords = (np.arange(nx, dtype=np.float64) + 0.5) * dx - radius
+y_coords = (np.arange(ny, dtype=np.float64) + 0.5) * dy - radius
+z_coords = (np.arange(nz, dtype=np.float64) + 0.5) * dz
+R_coords = np.sqrt(x_coords[:, None, None] ** 2 + y_coords[None, :, None] ** 2)
+R_coords = np.broadcast_to(R_coords, (nx, ny, nz))
+
+OUTPUT_DIR = os.path.join("results", "compressible_model")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 dt = 0.0005  # initial time step (s)
 dt_max = 0.005  # maximum time-step size (s) - reduced for stability
 dt_min = 1e-6  # minimum time-step size for robustness
@@ -1363,49 +1371,269 @@ print(f"Final substrate concentration: {np.mean(C_sub[mask]):.2f} g/L")
 print(f"Average density: {np.mean(rho[mask]):.2f} kg/m³")
 print(f"Final temperature: {np.mean(T[mask]):.2f} °C")
 
-# Plotting
-fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+# =========================
+# Post-processing & spatial visualization
+# =========================
+PLOT_STYLE = {
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 120,
+    "savefig.dpi": 300,
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+}
+TIME_LABEL = "Simulation time t [s]"
 
-axes[0, 0].plot(history['time'], history['volume'], 'b-', marker='o', markersize=3, linewidth=2)
-axes[0, 0].set_ylabel('Volume [L]')
-axes[0, 0].set_title('Fed-Batch Volume Profile')
-axes[0, 0].grid(True, alpha=0.3)
 
-axes[0, 1].plot(history['time'], history['X_bio_avg'], 'g-', label='Avg', marker='o', markersize=3, linewidth=2)
-axes[0, 1].plot(history['time'], history['X_bio_max'], 'g--', label='Max', marker='o', markersize=3, linewidth=1)
-axes[0, 1].set_ylabel('Biomass [g/L]')
-axes[0, 1].set_title('Biomass Concentration')
-axes[0, 1].legend()
-axes[0, 1].grid(True, alpha=0.3)
+def masked_field(field):
+    """Return field with solid/non-liquid cells set to NaN for plotting."""
+    out = np.asarray(field, dtype=np.float64).copy()
+    out[~mask] = np.nan
+    return out
 
-axes[0, 2].plot(history['time'], history['C_sub_avg'], 'purple', label='Avg', marker='o', markersize=3, linewidth=2)
-axes[0, 2].plot(history['time'], history['C_sub_max'], 'purple', linestyle='--', label='Max', marker='o', markersize=3, linewidth=1)
-axes[0, 2].set_ylabel('Substrate [g/L]')
-axes[0, 2].set_title('Substrate Concentration')
-axes[0, 2].legend()
-axes[0, 2].grid(True, alpha=0.3)
 
-axes[1, 0].plot(history['time'], history['C_O2_avg'], 'orange', label='Avg', marker='o', markersize=3, linewidth=2)
-axes[1, 0].plot(history['time'], history['C_O2_max'], 'orange', linestyle='--', label='Max', marker='o', markersize=3, linewidth=1)
-axes[1, 0].set_ylabel('Oxygen [mol/m³]')
-axes[1, 0].set_xlabel('Time [s]')
-axes[1, 0].set_title('Dissolved Oxygen Concentration')
-axes[1, 0].legend()
-axes[1, 0].grid(True, alpha=0.3)
+def save_figure(fig, filename):
+    path = os.path.join(OUTPUT_DIR, filename)
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
 
-axes[1, 1].plot(history['time'], history['T_avg'], 'r-', label='Avg', marker='o', markersize=3, linewidth=2)
-axes[1, 1].plot(history['time'], history['T_max'], 'r--', label='Max', marker='o', markersize=3, linewidth=1)
-axes[1, 1].set_ylabel('Temperature [°C]')
-axes[1, 1].set_xlabel('Time [s]')
-axes[1, 1].set_title('Temperature Profile')
-axes[1, 1].legend()
-axes[1, 1].grid(True, alpha=0.3)
 
-axes[1, 2].plot(history['time'], history['OTR'], 'b-', marker='o', markersize=3, linewidth=2)
-axes[1, 2].set_ylabel('OTR [mol/s]')
-axes[1, 2].set_xlabel('Time [s]')
-axes[1, 2].set_title('Oxygen Transfer Rate')
-axes[1, 2].grid(True, alpha=0.3)
+def plot_scalar_map(ax, field, extent, title, cbar_label, cmap):
+    im = ax.imshow(
+        field.T,
+        origin="lower",
+        extent=extent,
+        aspect="auto",
+        cmap=cmap,
+        interpolation="nearest",
+    )
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label)
+    ax.set_title(title)
+    return im
 
-plt.tight_layout()
+
+# Final spatial fields at end of simulation
+C_sat_final = henry_saturation(T, P_gas)
+kLa_final = update_kLa_field(N_rpm, len(history["time"]))
+OTR_field = oxygen_transfer_rate(C_O2, C_sat_final, kLa_final)
+speed_field = np.sqrt(u ** 2 + v ** 2 + w ** 2)
+
+np.savez(
+    os.path.join(OUTPUT_DIR, "final_fields.npz"),
+    x=x_coords,
+    y=y_coords,
+    z=z_coords,
+    mask=mask,
+    X_bio=X_bio,
+    C_sub=C_sub,
+    C_O2=C_O2,
+    T=T,
+    OTR_local=OTR_field,
+    kLa=kLa_final,
+    speed=speed_field,
+    u=u,
+    v=v,
+    w=w,
+    p=p,
+    rho=rho,
+    history_time=np.array(history["time"]),
+    history_OTR=np.array(history["OTR"]),
+)
+
+i_center, j_center = nx // 2, ny // 2
+k_mid = nz // 2
+j_mid = ny // 2
+extent_xz = [x_coords[0], x_coords[-1], z_coords[0], z_coords[-1]]
+extent_xy = [x_coords[0], x_coords[-1], y_coords[0], y_coords[-1]]
+
+with plt.rc_context(PLOT_STYLE):
+    # --- Figure 1: vertical mid-plane maps (x-z through reactor center) ---
+    fig_maps, axes_maps = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_maps.suptitle(
+        f"Spatial state fields at t = {time:.2f} s  |  "
+        f"D = {diameter:.2f} m, H = {height:.2f} m, {n_impellers} impellers @ {N_rpm:.0f} rpm",
+        fontsize=12,
+        y=1.02,
+    )
+    spatial_maps = [
+        (masked_field(X_bio)[:, j_mid, :], "Biomass concentration X [g/L]", "YlGn"),
+        (masked_field(C_sub)[:, j_mid, :], "Substrate concentration S [g/L]", "Purples"),
+        (masked_field(C_O2)[:, j_mid, :], "Dissolved O₂ concentration C_O₂ [mol/m³]", "plasma"),
+        (masked_field(T)[:, j_mid, :], "Liquid temperature T [°C]", "inferno"),
+        (masked_field(OTR_field)[:, j_mid, :], "Local OTR [mol/(m³·s)]", "Blues"),
+        (masked_field(speed_field)[:, j_mid, :], "Flow speed |u| [m/s]", "turbo"),
+    ]
+    for ax, (data, cbar_label, cmap) in zip(axes_maps.ravel(), spatial_maps):
+        plot_scalar_map(
+            ax,
+            data,
+            extent_xz,
+            title=cbar_label.split("[")[0].strip(),
+            cbar_label=cbar_label,
+            cmap=cmap,
+        )
+        ax.set_xlabel("Radial position x [m]")
+        ax.set_ylabel("Axial position z [m]")
+    save_figure(fig_maps, "spatial_fields_xz_midplane.png")
+
+    # --- Figure 2: horizontal mid-height maps (x-y at impeller mid-plane) ---
+    fig_xy, axes_xy = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_xy.suptitle(
+        f"Horizontal slice at z = {z_coords[k_mid]:.2f} m (mid liquid height)",
+        fontsize=12,
+        y=1.02,
+    )
+    horizontal_maps = [
+        (masked_field(X_bio)[:, :, k_mid], "Biomass concentration X [g/L]", "YlGn"),
+        (masked_field(C_sub)[:, :, k_mid], "Substrate concentration S [g/L]", "Purples"),
+        (masked_field(C_O2)[:, :, k_mid], "Dissolved O₂ concentration C_O₂ [mol/m³]", "plasma"),
+        (masked_field(T)[:, :, k_mid], "Liquid temperature T [°C]", "inferno"),
+        (masked_field(OTR_field)[:, :, k_mid], "Local OTR [mol/(m³·s)]", "Blues"),
+        (masked_field(speed_field)[:, :, k_mid], "Flow speed |u| [m/s]", "turbo"),
+    ]
+    for ax, (data, cbar_label, cmap) in zip(axes_xy.ravel(), horizontal_maps):
+        plot_scalar_map(
+            ax,
+            data,
+            extent_xy,
+            title=cbar_label.split("[")[0].strip(),
+            cbar_label=cbar_label,
+            cmap=cmap,
+        )
+        ax.set_xlabel("Radial position x [m]")
+        ax.set_ylabel("Radial position y [m]")
+    save_figure(fig_xy, "spatial_fields_xy_midheight.png")
+
+    # --- Figure 3: axial profiles along reactor centerline ---
+    fig_axial, axes_axial = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_axial.suptitle("Axial profiles along centerline (x = 0, y = 0)", fontsize=12, y=1.02)
+    center_profiles = [
+        (X_bio[i_center, j_center, :], "Biomass concentration X [g/L]", "tab:green"),
+        (C_sub[i_center, j_center, :], "Substrate concentration S [g/L]", "tab:purple"),
+        (C_O2[i_center, j_center, :], "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange"),
+        (T[i_center, j_center, :], "Liquid temperature T [°C]", "tab:red"),
+        (OTR_field[i_center, j_center, :], "Local OTR [mol/(m³·s)]", "tab:blue"),
+        (speed_field[i_center, j_center, :], "Flow speed |u| [m/s]", "tab:gray"),
+    ]
+    for ax, (values, ylabel, color) in zip(axes_axial.ravel(), center_profiles):
+        valid = mask[i_center, j_center, :]
+        ax.plot(z_coords[valid], values[valid], color=color, linewidth=2)
+        ax.set_xlabel("Axial position z [m]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel.split("[")[0].strip())
+    save_figure(fig_axial, "axial_profiles_centerline.png")
+
+    # --- Figure 4: radial profiles at impeller-relevant heights ---
+    impeller_z_indices = [int(0.30 * nz), int(0.50 * nz), int(0.65 * nz)]
+    fig_radial, axes_radial = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_radial.suptitle(
+        "Radial profiles at mid impeller height "
+        f"(z = {z_coords[impeller_z_indices[1]]:.2f} m)",
+        fontsize=12,
+        y=1.02,
+    )
+    k_imp = impeller_z_indices[1]
+    r_line = R_coords[:, j_center, k_imp]
+    radial_profiles = [
+        (X_bio[:, j_center, k_imp], "Biomass concentration X [g/L]", "tab:green"),
+        (C_sub[:, j_center, k_imp], "Substrate concentration S [g/L]", "tab:purple"),
+        (C_O2[:, j_center, k_imp], "Dissolved O₂ concentration C_O₂ [mol/m³]", "tab:orange"),
+        (T[:, j_center, k_imp], "Liquid temperature T [°C]", "tab:red"),
+        (OTR_field[:, j_center, k_imp], "Local OTR [mol/(m³·s)]", "tab:blue"),
+        (speed_field[:, j_center, k_imp], "Flow speed |u| [m/s]", "tab:gray"),
+    ]
+    for ax, (values, ylabel, color) in zip(axes_radial.ravel(), radial_profiles):
+        valid = mask[:, j_center, k_imp]
+        ax.plot(r_line[valid], values[valid], color=color, linewidth=2)
+        ax.set_xlabel("Radial distance r [m]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel.split("[")[0].strip())
+    save_figure(fig_radial, "radial_profiles_impeller_height.png")
+
+    # --- Figure 5: integrated time-series dashboard ---
+    fig_ts, axes_ts = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig_ts.suptitle(
+        f"Transient reactor response  |  fed-batch strategy: {fed_batch_strategy}",
+        fontsize=12,
+        y=1.02,
+    )
+
+    axes_ts[0, 0].plot(history["time"], history["volume"], color="tab:blue", linewidth=2)
+    axes_ts[0, 0].set_xlabel(TIME_LABEL)
+    axes_ts[0, 0].set_ylabel("Liquid volume V [L]")
+    axes_ts[0, 0].set_title("Fed-batch liquid volume")
+
+    axes_ts[0, 1].plot(history["time"], history["X_bio_avg"], color="tab:green", linewidth=2, label="Volume average")
+    axes_ts[0, 1].plot(history["time"], history["X_bio_max"], color="tab:green", linestyle="--", linewidth=1.5, label="Spatial maximum")
+    axes_ts[0, 1].set_xlabel(TIME_LABEL)
+    axes_ts[0, 1].set_ylabel("Biomass concentration X [g/L]")
+    axes_ts[0, 1].set_title("Biomass concentration")
+    axes_ts[0, 1].legend(frameon=False)
+
+    axes_ts[0, 2].plot(history["time"], history["C_sub_avg"], color="tab:purple", linewidth=2, label="Volume average")
+    axes_ts[0, 2].plot(history["time"], history["C_sub_max"], color="tab:purple", linestyle="--", linewidth=1.5, label="Spatial maximum")
+    axes_ts[0, 2].set_xlabel(TIME_LABEL)
+    axes_ts[0, 2].set_ylabel("Substrate concentration S [g/L]")
+    axes_ts[0, 2].set_title("Substrate concentration")
+    axes_ts[0, 2].legend(frameon=False)
+
+    axes_ts[1, 0].plot(history["time"], history["C_O2_avg"], color="tab:orange", linewidth=2, label="Volume average")
+    axes_ts[1, 0].plot(history["time"], history["C_O2_max"], color="tab:orange", linestyle="--", linewidth=1.5, label="Spatial maximum")
+    axes_ts[1, 0].set_xlabel(TIME_LABEL)
+    axes_ts[1, 0].set_ylabel("Dissolved O₂ concentration C_O₂ [mol/m³]")
+    axes_ts[1, 0].set_title("Dissolved oxygen")
+    axes_ts[1, 0].legend(frameon=False)
+
+    axes_ts[1, 1].plot(history["time"], history["T_avg"], color="tab:red", linewidth=2, label="Volume average")
+    axes_ts[1, 1].plot(history["time"], history["T_max"], color="tab:red", linestyle="--", linewidth=1.5, label="Spatial maximum")
+    axes_ts[1, 1].set_xlabel(TIME_LABEL)
+    axes_ts[1, 1].set_ylabel("Liquid temperature T [°C]")
+    axes_ts[1, 1].set_title("Liquid temperature")
+    axes_ts[1, 1].legend(frameon=False)
+
+    axes_ts[1, 2].plot(history["time"], history["OTR"], color="tab:blue", linewidth=2)
+    axes_ts[1, 2].set_xlabel(TIME_LABEL)
+    axes_ts[1, 2].set_ylabel("Total OTR [mol/s]")
+    axes_ts[1, 2].set_title("Oxygen transfer rate (volume integral)")
+
+    save_figure(fig_ts, "transient_timeseries.png")
+
+summary_path = os.path.join(OUTPUT_DIR, "simulation_summary.txt")
+with open(summary_path, "w", encoding="utf-8") as summary_file:
+    summary_file.write("Weakly Compressible Bioreactor Simulation Summary\n")
+    summary_file.write("=" * 52 + "\n")
+    summary_file.write(f"Simulation time: {time:.2f} s ({t_step} steps)\n")
+    summary_file.write(f"Geometry: D={diameter:.3f} m, H={height:.3f} m, V={volume_target:.3f} m^3\n")
+    summary_file.write(f"Grid: {nx} x {ny} x {nz} cells\n")
+    summary_file.write(f"Impellers: {n_impellers} @ {N_rpm:.0f} rpm\n")
+    summary_file.write(f"Fed-batch: {fed_batch_strategy}, start={fed_batch_start_time:.1f} s\n")
+    summary_file.write(f"Final liquid volume: {volume_L:.2f} L\n")
+    summary_file.write(f"Volume-averaged biomass X: {np.mean(X_bio[mask]):.3f} g/L\n")
+    summary_file.write(f"Volume-averaged substrate S: {np.mean(C_sub[mask]):.3f} g/L\n")
+    summary_file.write(f"Volume-averaged O2 C_O2: {np.mean(C_O2[mask]):.4f} mol/m^3\n")
+    summary_file.write(f"Volume-averaged temperature T: {np.mean(T[mask]):.3f} C\n")
+    summary_file.write(f"Total OTR (final step): {history['OTR'][-1]:.4e} mol/s\n")
+    summary_file.write(f"Peak local OTR: {np.max(OTR_field[mask]):.4e} mol/(m^3 s)\n")
+    summary_file.write(f"Peak flow speed: {np.max(speed_field[mask]):.4f} m/s\n")
+
+print(f"\nSpatial outputs saved to: {os.path.abspath(OUTPUT_DIR)}")
+print(f"  - spatial_fields_xz_midplane.png")
+print(f"  - spatial_fields_xy_midheight.png")
+print(f"  - axial_profiles_centerline.png")
+print(f"  - radial_profiles_impeller_height.png")
+print(f"  - transient_timeseries.png")
+print(f"  - final_fields.npz")
+print(f"  - simulation_summary.txt")
+
 plt.show()
+
+

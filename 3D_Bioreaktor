@@ -253,7 +253,7 @@ streamlines = grid.streamlines(
     vectors="velocity",
     source_radius=0.3,
     n_points=400,
-    max_time=400
+    max_length=400
 )
 
 plotter.add_mesh(streamlines, color="blue")
