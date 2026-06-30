@@ -23,6 +23,66 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 
+FAST_MODE = os.environ.get("BIOREACTOR_FULL", "0") != "1"
+
+
+@dataclass(frozen=True)
+class MeshQuality:
+    """Mesh resolution presets — lower values render faster."""
+
+    shell: int = 48
+    head: int = 32
+    shaft: int = 24
+    impeller: int = 32
+    sparger: int = 40
+    sparger_v: int = 16
+    liquid: int = 48
+    port: int = 12
+    floor: int = 40
+    field_stride: int = 2
+    window: tuple[int, int] = (1280, 800)
+    show_edges: bool = True
+    shell_outline: bool = True
+
+    @classmethod
+    def fast(cls) -> "MeshQuality":
+        return cls(
+            shell=32,
+            head=24,
+            shaft=16,
+            impeller=24,
+            sparger=24,
+            sparger_v=12,
+            liquid=32,
+            port=8,
+            floor=24,
+            field_stride=3,
+            window=(960, 600),
+            show_edges=False,
+            shell_outline=False,
+        )
+
+    @classmethod
+    def full(cls) -> "MeshQuality":
+        return cls(
+            shell=96,
+            head=64,
+            shaft=48,
+            impeller=64,
+            sparger=80,
+            sparger_v=32,
+            liquid=96,
+            port=24,
+            floor=80,
+            field_stride=1,
+            window=(1600, 1000),
+            show_edges=True,
+            shell_outline=True,
+        )
+
+
+DEFAULT_QUALITY = MeshQuality.fast() if FAST_MODE else MeshQuality.full()
+
 # ---------------------------------------------------------------------------
 # Geometry specification (typical large-scale STR, ~20 m³)
 # ---------------------------------------------------------------------------
@@ -238,24 +298,23 @@ def create_rushton_impeller(geom: STRGeometry, z: float, resolution: int = 64) -
     return _merge([disk, *blades])
 
 
-def create_sparger_ring(geom: STRGeometry, resolution: int = 80) -> pv.PolyData:
+def create_sparger_ring(geom: STRGeometry, resolution: int = 80, v_res: int = 32) -> pv.PolyData:
     r_ring = geom.sparger_ring_diameter_ratio * geom.radius
     z = geom.sparger_elevation
-    torus = pv.ParametricTorus(ringradius=r_ring, crosssectionradius=0.025, u_res=resolution, v_res=32)
+    torus = pv.ParametricTorus(ringradius=r_ring, crosssectionradius=0.025, u_res=resolution, v_res=v_res)
     torus.translate((0.0, 0.0, z), inplace=True)
-    # Dip tube from top
     dip = pv.Cylinder(
         center=(geom.radius * 0.35, 0.0, geom.liquid_height * 0.55),
         direction=(0.0, 0.0, 1.0),
         radius=0.035,
         height=geom.liquid_height * 0.5,
-        resolution=24,
+        resolution=max(12, v_res),
     )
     dip.rotate_z(12, point=(0.0, 0.0, 0.0), inplace=True)
     return _merge([torus, dip])
 
 
-def create_probe_ports(geom: STRGeometry) -> pv.PolyData:
+def create_probe_ports(geom: STRGeometry, resolution: int = 24) -> pv.PolyData:
     """Sample / pH / DO probe nozzles on the shell (typical STR instrumentation)."""
     ports = []
     specs = [
@@ -269,7 +328,7 @@ def create_probe_ports(geom: STRGeometry) -> pv.PolyData:
             direction=(1.0, 0.0, 0.0),
             radius=0.045,
             height=length,
-            resolution=24,
+            resolution=resolution,
         )
         nozzle.rotate_z(angle_deg, point=(0.0, 0.0, 0.0), inplace=True)
         ports.append(nozzle)
@@ -288,22 +347,25 @@ def create_liquid_volume(geom: STRGeometry, resolution: int = 96) -> pv.PolyData
     return liquid
 
 
-def load_simulation_field(npz_path: Path, key: str = "C_O2") -> tuple[pv.StructuredGrid | None, str]:
+def load_simulation_field(
+    npz_path: Path,
+    key: str = "C_O2",
+    stride: int = 1,
+) -> tuple[pv.StructuredGrid | None, str]:
     """Optional: colour liquid with a simulation field from final_fields.npz."""
     if not npz_path.is_file():
         return None, ""
     data = np.load(npz_path)
     if key not in data or "x" not in data or "mask" not in data:
         return None, ""
-    x = data["x"]
-    y = data["y"]
-    z = data["z"]
-    field = data[key]
-    mask = data["mask"]
-    nx, ny, nz = field.shape
+    x = data["x"][::stride]
+    y = data["y"][::stride]
+    z = data["z"][::stride]
+    field = data[key][::stride, ::stride, ::stride]
+    mask = data["mask"][::stride, ::stride, ::stride]
     xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
     grid = pv.StructuredGrid(xx, yy, zz)
-    values = np.asarray(field, dtype=np.float64).copy()
+    values = np.asarray(field, dtype=np.float32).copy()
     values[~mask] = np.nan
     grid[key] = values.flatten(order="F")
     labels = {
@@ -320,21 +382,23 @@ def build_str_reactor(
     geom: STRGeometry | None = None,
     field_npz: Path | None = None,
     field_key: str = "C_O2",
+    quality: MeshQuality | None = None,
 ) -> tuple[pv.Plotter, dict]:
     geom = geom or STRGeometry()
-    plotter = pv.Plotter(window_size=(1600, 1000), lighting="three lights")
+    q = quality or DEFAULT_QUALITY
+    plotter = pv.Plotter(window_size=q.window, lighting="three lights")
     plotter.set_background("#E8EDF2", top="#F7F9FB")
 
-    dish = create_torispherical_bottom(geom)
-    shell = create_cylindrical_shell(geom)
-    top_head, motor = create_top_head(geom)
+    dish = create_torispherical_bottom(geom, resolution=q.shell)
+    shell = create_cylindrical_shell(geom, resolution=q.shell)
+    top_head, motor = create_top_head(geom, resolution=q.head)
     baffles = create_baffles(geom)
-    shaft = create_shaft(geom)
-    sparger = create_sparger_ring(geom)
-    ports = create_probe_ports(geom)
-    liquid = create_liquid_volume(geom)
+    shaft = create_shaft(geom, resolution=q.shaft)
+    sparger = create_sparger_ring(geom, resolution=q.sparger, v_res=q.sparger_v)
+    ports = create_probe_ports(geom, resolution=q.port)
+    liquid = create_liquid_volume(geom, resolution=q.liquid)
 
-    impellers = [create_rushton_impeller(geom, z) for z in geom.impeller_z_positions]
+    impellers = [create_rushton_impeller(geom, z, resolution=q.impeller) for z in geom.impeller_z_positions]
 
     # Tank envelope (semi-transparent stainless steel)
     for mesh, name in [
@@ -357,17 +421,25 @@ def build_str_reactor(
         _apply_material(actor, MATERIALS[mat])
 
     for imp in impellers:
-        actor = plotter.add_mesh(imp, smooth_shading=True, show_edges=True, edge_color="#3A4048", line_width=0.6)
+        actor = plotter.add_mesh(
+            imp,
+            smooth_shading=True,
+            show_edges=q.show_edges,
+            edge_color="#3A4048",
+            line_width=0.6,
+        )
         _apply_material(actor, MATERIALS["impeller"])
 
-    # Wireframe outline for shell readability
-    outline = shell.extract_surface(algorithm="dataset_surface").extract_feature_edges(
-        boundary_edges=True, feature_edges=False
-    )
-    plotter.add_mesh(outline, color="#6B7280", line_width=1.2, name="shell_edges")
+    if q.shell_outline:
+        outline = shell.extract_surface(algorithm="dataset_surface").extract_feature_edges(
+            boundary_edges=True, feature_edges=False
+        )
+        plotter.add_mesh(outline, color="#6B7280", line_width=1.2, name="shell_edges")
 
     # Liquid + optional simulation scalar
-    sim_grid, field_label = load_simulation_field(field_npz, field_key) if field_npz else (None, "")
+    sim_grid, field_label = (
+        load_simulation_field(field_npz, field_key, stride=q.field_stride) if field_npz else (None, "")
+    )
     if sim_grid is not None and field_key in sim_grid.array_names:
         plotter.add_volume(
             sim_grid,
@@ -381,7 +453,7 @@ def build_str_reactor(
         _apply_material(actor, MATERIALS["liquid"])
 
     # Floor shadow disc
-    floor = pv.Disc(inner=0, outer=geom.radius * 1.35, c_res=80, normal=(0, 0, 1))
+    floor = pv.Disc(inner=0, outer=geom.radius * 1.35, c_res=q.floor, normal=(0, 0, 1))
     floor.translate((0, 0, -0.02), inplace=True)
     plotter.add_mesh(floor, color="#D1D5DB", opacity=0.35)
 
@@ -436,7 +508,24 @@ def main() -> None:
     )
     parser.add_argument("--show", action="store_true", help="Open interactive window")
     parser.add_argument("--off-screen", action="store_true", help="Render without GUI")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Low mesh resolution and subsampled field overlay (default unless BIOREACTOR_FULL=1)",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="High mesh resolution (overrides --fast)",
+    )
     args = parser.parse_args()
+
+    if args.full:
+        quality = MeshQuality.full()
+    elif args.fast or FAST_MODE:
+        quality = MeshQuality.fast()
+    else:
+        quality = MeshQuality.full()
 
     if args.off_screen:
         pv.OFF_SCREEN = True
@@ -445,7 +534,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     npz = args.field_npz if args.field_npz.is_file() else None
-    plotter, meta = build_str_reactor(field_npz=npz, field_key=args.field_key)
+    plotter, meta = build_str_reactor(field_npz=npz, field_key=args.field_key, quality=quality)
 
     if args.off_screen:
         plotter.render()
