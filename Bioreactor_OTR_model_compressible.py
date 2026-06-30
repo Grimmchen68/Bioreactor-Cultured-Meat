@@ -34,8 +34,59 @@ radius = diameter / 2.0
 volume_target = np.pi * radius**2 * height  # m^3
 liquid_fill_fraction = 0.8  # fraction of tank height occupied by liquid
 
-# Reduced grid resolution for faster simulation
-nx, ny, nz = 24, 24, 32
+# =========================
+# Performance profile
+# =========================
+# FAST_MODE=True: lower grid, shorter run, fewer plots — good for interactive work.
+# Set FAST_MODE=False (or env BIOREACTOR_FULL=1) for long / high-res runs.
+FAST_MODE = os.environ.get("BIOREACTOR_FULL", "0") != "1"
+
+if FAST_MODE:
+    nx, ny, nz = 16, 16, 20
+    t_final = 30.0
+    history_stride = 10
+    progress_stride = 25
+    verbose_diagnostics = False
+    export_individual_field_pngs = False
+    export_contour_pngs = False
+    export_individual_timeseries_pngs = False
+    export_individual_profile_pngs = False
+    export_radial_profiles = False
+    export_otr_individual_pngs = False
+    plot_savefig_dpi = 120
+    show_plots = False
+    dt_max = 0.02
+    cfl_target = 0.2
+    pressure_cg_maxiter = 120
+    pressure_sor_maxiter = 40
+    pressure_sor_tol = 5e-4
+else:
+    nx, ny, nz = 24, 24, 32
+    t_final = 3600.0
+    history_stride = 1
+    progress_stride = 100
+    verbose_diagnostics = True
+    export_individual_field_pngs = True
+    export_contour_pngs = True
+    export_individual_timeseries_pngs = True
+    export_individual_profile_pngs = True
+    export_radial_profiles = True
+    export_otr_individual_pngs = True
+    plot_savefig_dpi = 200
+    show_plots = True
+    dt_max = 0.005
+    cfl_target = 0.1
+    pressure_cg_maxiter = 1000
+    pressure_sor_maxiter = 200
+    pressure_sor_tol = 1e-4
+
+print(
+    f"Mode: {'FAST (demo)' if FAST_MODE else 'FULL'} — "
+    f"grid {nx}x{ny}x{nz}, t_final={t_final:.0f} s — "
+    f"set BIOREACTOR_FULL=1 for full run",
+    flush=True,
+)
+
 Lx = Ly = diameter
 Lz = height
 
@@ -120,12 +171,10 @@ R_coords = np.broadcast_to(R_coords, (nx, ny, nz))
 OUTPUT_DIR = os.path.join("results", "compressible_model")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 dt = 0.0005  # initial time step (s)
-dt_max = 0.005  # maximum time-step size (s) - reduced for stability
 dt_min = 1e-6  # minimum time-step size for robustness
 dt_reduction_factor = 0.5  # reduce dt when step retries are needed
 max_step_retries = 3  # limit number of retry attempts
 nt = 1000000  # safety cap (increased for long simulations)
-t_final = 3600  
 
 mu = 0.005  # Molecular (dynamic) viscosity [Pa·s]
 
@@ -604,13 +653,15 @@ def pressure_poisson(p, u_star, v_star, w_star, rho_field, k_field=None):
     x0 = np.array([p64[i + 1, j + 1, k + 1] for i, j, k in fluid], dtype=np.float64)
 
     recovery_used = False
-    p_vec, info = cg(A, rhs, x0=x0, rtol=1e-8, atol=1e-10, maxiter=1000)
+    p_vec, info = cg(A, rhs, x0=x0, rtol=1e-8, atol=1e-10, maxiter=pressure_cg_maxiter)
     converged = info == 0
 
     if not converged or np.isnan(p_vec).any() or np.isinf(p_vec).any():
         recovery_used = True
         p64.fill(0.0)
-        eq_res, converged = _pressure_poisson_sor(p64, b64, mi)
+        eq_res, converged = _pressure_poisson_sor(
+            p64, b64, mi, max_iter=pressure_sor_maxiter, tol=pressure_sor_tol
+        )
         if not converged:
             print(f"pressure_poisson warning: SOR fallback did not fully converge, eq_res={eq_res:.3e}")
     else:
@@ -1001,7 +1052,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
     speed = np.sqrt(u**2 + v**2 + w**2)
     max_speed = np.max(speed) + 1e-6
 
-    CFL_target = 0.1  # lower CFL target for smaller adaptive dt
+    CFL_target = cfl_target  # adaptive dt from grid CFL
     dt = CFL_target * dx / max_speed
     dt = max(dt_min, min(dt, dt_max))
 
@@ -1126,7 +1177,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
         T = T + dt * (-conv_T + diff_T + Q_bio / rho_cp + Q_wall / rho_cp)
 
         # Diagnostic: check for NaNs/Infs before pressure solve
-        if t_step < 5:
+        if verbose_diagnostics and t_step < 5:
             for name, arr in [('u_star', u_star), ('v_star', v_star), ('w_star', w_star), ('rho', rho), ('mu_eff', mu_eff), ('k_turb', k_turb), ('epsilon_turb', epsilon_turb)]:
                 try:
                     print(f"{name}: hasNaN={np.isnan(arr).any()}, hasInf={np.isinf(arr).any()}, min={np.nanmin(arr):.3e}, max={np.nanmax(arr):.3e}")
@@ -1204,7 +1255,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
         v_new[~mask] = 0.0
         w_new[~mask] = 0.0
 
-        if t_step < 5:
+        if verbose_diagnostics and t_step < 5:
             print(f"u_new stats: min={np.min(u_new):.3e}, max={np.max(u_new):.3e}, mean={np.mean(u_new):.3e}")
             print(f"v_new stats: min={np.min(v_new):.3e}, max={np.max(v_new):.3e}, mean={np.mean(v_new):.3e}")
             print(f"w_new stats: min={np.min(w_new):.3e}, max={np.max(w_new):.3e}, mean={np.mean(w_new):.3e}")
@@ -1239,7 +1290,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
                 step_success = False
                 break
 
-        if t_step < 5:
+        if verbose_diagnostics and t_step < 5:
             projected_div = divergence_mass(rho, u, v, w)
             du = u - u_star
             dv = v - v_star
@@ -1287,7 +1338,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
         T = np.clip(T, 20.0, 50.0)
 
         # Diagnostic: check for NaNs/Infs after pressure update
-        if t_step < 5:
+        if verbose_diagnostics and t_step < 5:
             for name, arr in [('u', u), ('v', v), ('w', w), ('rho', rho), ('p', p)]:
                 try:
                     print(f"post-p solve {name}: hasNaN={np.isnan(arr).any()}, hasInf={np.isinf(arr).any()}, min={np.nanmin(arr):.3e}, max={np.nanmax(arr):.3e}")
@@ -1297,7 +1348,7 @@ while time < t_final and t_step < max(nt, est_steps*10):
         div_fluid = np.max(np.abs(div_field[mask])) if np.any(mask) else 0.0
         div_global = np.max(np.abs(div_field))
         # Diagnostic prints: show shapes and stats for first steps or large fluid divergence
-        if t_step < 5 or div_fluid > 0.1:
+        if verbose_diagnostics and (t_step < 5 or div_fluid > 0.1):
             try:
                 # Check divergence of forcing terms (should be small)
                 # Check force per unit mass for NaNs/Infs before differencing
@@ -1328,26 +1379,30 @@ while time < t_final and t_step < max(nt, est_steps*10):
 
         dt = min(dt, dt_max)
 
-        history['time'].append(time)
-        history['OTR'].append(np.sum(OTR_local[mask]) * dx * dy * dz)
-        history['C_O2_avg'].append(np.mean(C_O2[mask]))
-        history['C_O2_max'].append(np.max(C_O2[mask]))
-        history['C_sub_avg'].append(np.mean(C_sub[mask]))
-        history['C_sub_max'].append(np.max(C_sub[mask]))
-        history['X_bio_avg'].append(np.mean(X_bio[mask]))
-        history['X_bio_max'].append(np.max(X_bio[mask]))
-        history['T_avg'].append(np.mean(T[mask]))
-        history['T_max'].append(np.max(T[mask]))
-        history['rho_avg'].append(np.mean(rho[mask]))
-        history['max_velocity'].append(max_speed)
-        history['volume'].append(volume_L)
-        history['k_turb_avg'].append(np.mean(k_turb[mask]))
-        history['k_turb_max'].append(np.max(k_turb[mask]))
-        history['epsilon_turb_avg'].append(np.mean(epsilon_turb[mask]))
-        history['epsilon_turb_max'].append(np.max(epsilon_turb[mask]))
-        history['mu_t_avg'].append(np.mean(mu_t[mask]))
-        history['pressure_recovery_used'].append(int(pressure_recovery_used))
-        history['pressure_dt_retries'].append(retry_count)
+        if t_step % history_stride == 0:
+            history['time'].append(time)
+            history['OTR'].append(np.sum(OTR_local[mask]) * dx * dy * dz)
+            history['C_O2_avg'].append(np.mean(C_O2[mask]))
+            history['C_O2_max'].append(np.max(C_O2[mask]))
+            history['C_sub_avg'].append(np.mean(C_sub[mask]))
+            history['C_sub_max'].append(np.max(C_sub[mask]))
+            history['X_bio_avg'].append(np.mean(X_bio[mask]))
+            history['X_bio_max'].append(np.max(X_bio[mask]))
+            history['T_avg'].append(np.mean(T[mask]))
+            history['T_max'].append(np.max(T[mask]))
+            history['rho_avg'].append(np.mean(rho[mask]))
+            history['max_velocity'].append(max_speed)
+            history['volume'].append(volume_L)
+            history['k_turb_avg'].append(np.mean(k_turb[mask]))
+            history['k_turb_max'].append(np.max(k_turb[mask]))
+            history['epsilon_turb_avg'].append(np.mean(epsilon_turb[mask]))
+            history['epsilon_turb_max'].append(np.max(epsilon_turb[mask]))
+            history['mu_t_avg'].append(np.mean(mu_t[mask]))
+            history['pressure_recovery_used'].append(int(pressure_recovery_used))
+            history['pressure_dt_retries'].append(retry_count)
+
+        if t_step > 0 and t_step % progress_stride == 0:
+            print(f"  step {t_step}, t={time:.1f}/{t_final:.0f} s, X={np.mean(X_bio[mask]):.2f} g/L")
 
         div_velocity = np.max(np.abs(divergence(u, v, w)[mask])) if np.any(mask) else 0.0
         div_mass_norm = np.max(np.abs(div_field[mask] / rho[mask])) if np.any(mask) else 0.0
@@ -1364,6 +1419,29 @@ while time < t_final and t_step < max(nt, est_steps*10):
     if not step_success:
         print(f"ERROR: timestep {t_step} failed after {retry_count} retries. Aborting simulation.")
         break
+
+# Ensure final state is in history when subsampling
+if history_stride > 1 and (not history["time"] or history["time"][-1] != time):
+    history["time"].append(time)
+    history["OTR"].append(np.sum(OTR_local[mask]) * dx * dy * dz)
+    history["C_O2_avg"].append(np.mean(C_O2[mask]))
+    history["C_O2_max"].append(np.max(C_O2[mask]))
+    history["C_sub_avg"].append(np.mean(C_sub[mask]))
+    history["C_sub_max"].append(np.max(C_sub[mask]))
+    history["X_bio_avg"].append(np.mean(X_bio[mask]))
+    history["X_bio_max"].append(np.max(X_bio[mask]))
+    history["T_avg"].append(np.mean(T[mask]))
+    history["T_max"].append(np.max(T[mask]))
+    history["rho_avg"].append(np.mean(rho[mask]))
+    history["max_velocity"].append(float(np.max(np.sqrt(u**2 + v**2 + w**2))))
+    history["volume"].append(volume_L)
+    history["k_turb_avg"].append(np.mean(k_turb[mask]))
+    history["k_turb_max"].append(np.max(k_turb[mask]))
+    history["epsilon_turb_avg"].append(np.mean(epsilon_turb[mask]))
+    history["epsilon_turb_max"].append(np.max(epsilon_turb[mask]))
+    history["mu_t_avg"].append(np.mean(mu_t[mask]))
+    history["pressure_recovery_used"].append(int(pressure_recovery_used))
+    history["pressure_dt_retries"].append(retry_count)
 
 print(f"\n=== Fed-Batch Bioreactor Simulation Complete ===")
 print(f"Simulation finished after {t_step} steps, final time {time:.2f} s")
@@ -1384,8 +1462,8 @@ PLOT_STYLE = {
     "xtick.labelsize": 9,
     "ytick.labelsize": 9,
     "legend.fontsize": 9,
-    "figure.dpi": 120,
-    "savefig.dpi": 300,
+    "figure.dpi": 100,
+    "savefig.dpi": plot_savefig_dpi,
     "axes.grid": True,
     "grid.alpha": 0.25,
     "axes.spines.top": False,
@@ -1411,7 +1489,7 @@ def masked_field(field):
 def save_figure(fig, filename):
     path = os.path.join(OUTPUT_DIR, filename)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    fig.savefig(path, bbox_inches="tight", facecolor="white", dpi=plot_savefig_dpi)
     plt.close(fig)
     return path
 
@@ -1505,7 +1583,7 @@ TIMESERIES_CATALOG = [
     ("turbulent_viscosity", "mu_t_avg", "Turbulent viscosity μ_t [Pa·s]", "tab:cyan", False),
 ]
 
-np.savez(
+np.savez_compressed(
     os.path.join(OUTPUT_DIR, "final_fields.npz"),
     x=x_coords,
     y=y_coords,
@@ -1543,40 +1621,42 @@ impeller_z_indices = [int(0.30 * nz), int(0.50 * nz), int(0.65 * nz)]
 
 with plt.rc_context(PLOT_STYLE):
     # --- Individual spatial PNG per scalar (3 orthogonal slices) ---
-    for slug, field, label, cmap in SCALAR_CATALOG:
-        data_xz = masked_field(field)[:, j_mid, :]
-        data_xy = masked_field(field)[:, :, k_mid]
-        data_yz = masked_field(field)[i_center, :, :]
+    if export_individual_field_pngs:
+        for slug, field, label, cmap in SCALAR_CATALOG:
+            data_xz = masked_field(field)[:, j_mid, :]
+            data_xy = masked_field(field)[:, :, k_mid]
+            data_yz = masked_field(field)[i_center, :, :]
 
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
-        fig.suptitle(
-            f"{label}  |  t = {time:.1f} s  |  3D bioreactor field",
-            fontsize=12,
-            y=1.03,
-        )
-        slices = [
-            (axes[0], data_xz, extent_xz, "Vertical slice (x–z)", "Radial position x [m]", "Axial position z [m]"),
-            (axes[1], data_xy, extent_xy, f"Horizontal slice (x–y) at z = {z_coords[k_mid]:.2f} m", "Radial position x [m]", "Radial position y [m]"),
-            (axes[2], data_yz, extent_yz, "Vertical slice (y–z)", "Radial position y [m]", "Axial position z [m]"),
-        ]
-        for ax, data, extent, title, xlabel, ylabel in slices:
-            plot_scalar_map(ax, data, extent, title, label, cmap)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-        save_figure(fig, os.path.join("fields", f"{slug}_3d_slices.png"))
+            fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+            fig.suptitle(
+                f"{label}  |  t = {time:.1f} s  |  3D bioreactor field",
+                fontsize=12,
+                y=1.03,
+            )
+            slices = [
+                (axes[0], data_xz, extent_xz, "Vertical slice (x–z)", "Radial position x [m]", "Axial position z [m]"),
+                (axes[1], data_xy, extent_xy, f"Horizontal slice (x–y) at z = {z_coords[k_mid]:.2f} m", "Radial position x [m]", "Radial position y [m]"),
+                (axes[2], data_yz, extent_yz, "Vertical slice (y–z)", "Radial position y [m]", "Axial position z [m]"),
+            ]
+            for ax, data, extent, title, xlabel, ylabel in slices:
+                plot_scalar_map(ax, data, extent, title, label, cmap)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+            save_figure(fig, os.path.join("fields", f"{slug}_3d_slices.png"))
 
-        fig_contour, ax_c = plt.subplots(figsize=(7, 5))
-        plot_contour_map(
-            ax_c,
-            data_xz,
-            extent_xz,
-            f"{label} — filled contours (x–z mid-plane)",
-            label,
-            cmap,
-        )
-        ax_c.set_xlabel("Radial position x [m]")
-        ax_c.set_ylabel("Axial position z [m]")
-        save_figure(fig_contour, os.path.join("fields", f"{slug}_contour_xz.png"))
+            if export_contour_pngs:
+                fig_contour, ax_c = plt.subplots(figsize=(7, 5))
+                plot_contour_map(
+                    ax_c,
+                    data_xz,
+                    extent_xz,
+                    f"{label} — filled contours (x–z mid-plane)",
+                    label,
+                    cmap,
+                )
+                ax_c.set_xlabel("Radial position x [m]")
+                ax_c.set_ylabel("Axial position z [m]")
+                save_figure(fig_contour, os.path.join("fields", f"{slug}_contour_xz.png"))
 
     # --- Axial volume-mean profiles for all biological / OTR scalars ---
     axial_keys = [
@@ -1599,29 +1679,31 @@ with plt.rc_context(PLOT_STYLE):
         ax.set_title(ylabel.split("[")[0].strip())
     save_figure(fig_axial_all, os.path.join("profiles", "axial_volume_mean_all_parameters.png"))
 
-    for slug, field, ylabel, color in axial_keys:
-        fig_p, ax_p = plt.subplots(figsize=(7, 4.5))
-        ax_p.plot(z_coords, volume_mean_along_z(field), color=color, linewidth=2)
-        ax_p.set_xlabel("Axial position z [m]")
-        ax_p.set_ylabel(ylabel)
-        ax_p.set_title(f"Volume-averaged axial profile — {ylabel.split('[')[0].strip()}")
-        save_figure(fig_p, os.path.join("profiles", f"{slug}_axial_volume_mean.png"))
+    if export_individual_profile_pngs:
+        for slug, field, ylabel, color in axial_keys:
+            fig_p, ax_p = plt.subplots(figsize=(7, 4.5))
+            ax_p.plot(z_coords, volume_mean_along_z(field), color=color, linewidth=2)
+            ax_p.set_xlabel("Axial position z [m]")
+            ax_p.set_ylabel(ylabel)
+            ax_p.set_title(f"Volume-averaged axial profile — {ylabel.split('[')[0].strip()}")
+            save_figure(fig_p, os.path.join("profiles", f"{slug}_axial_volume_mean.png"))
 
     # --- Radial profiles at three impeller heights ---
-    fig_radial_heights, axes_rh = plt.subplots(3, 4, figsize=(16, 11))
-    fig_radial_heights.suptitle("Radial profiles at three axial heights", fontsize=12, y=1.01)
-    radial_keys = axial_keys[:4]
-    for row, k_idx in enumerate(impeller_z_indices):
-        r_line = R_coords[:, j_center, k_idx]
-        for col, (slug, field, ylabel, color) in enumerate(radial_keys):
-            ax = axes_rh[row, col]
-            valid = mask[:, j_center, k_idx]
-            ax.plot(r_line[valid], field[:, j_center, k_idx][valid], color=color, linewidth=2)
-            ax.set_xlabel("Radial distance r [m]")
-            if col == 0:
-                ax.set_ylabel(f"z = {z_coords[k_idx]:.2f} m\n{ylabel.split('[')[0].strip()}")
-            ax.set_title(ylabel.split("[")[0].strip())
-    save_figure(fig_radial_heights, os.path.join("profiles", "radial_profiles_three_heights.png"))
+    if export_radial_profiles:
+        fig_radial_heights, axes_rh = plt.subplots(3, 4, figsize=(16, 11))
+        fig_radial_heights.suptitle("Radial profiles at three axial heights", fontsize=12, y=1.01)
+        radial_keys = axial_keys[:4]
+        for row, k_idx in enumerate(impeller_z_indices):
+            r_line = R_coords[:, j_center, k_idx]
+            for col, (slug, field, ylabel, color) in enumerate(radial_keys):
+                ax = axes_rh[row, col]
+                valid = mask[:, j_center, k_idx]
+                ax.plot(r_line[valid], field[:, j_center, k_idx][valid], color=color, linewidth=2)
+                ax.set_xlabel("Radial distance r [m]")
+                if col == 0:
+                    ax.set_ylabel(f"z = {z_coords[k_idx]:.2f} m\n{ylabel.split('[')[0].strip()}")
+                ax.set_title(ylabel.split("[")[0].strip())
+        save_figure(fig_radial_heights, os.path.join("profiles", "radial_profiles_three_heights.png"))
 
     # --- OTR analysis suite ---
     OTR_vol_vs_z = np.array([
@@ -1691,39 +1773,41 @@ with plt.rc_context(PLOT_STYLE):
 
     save_figure(fig_otr, os.path.join("otr", "otr_analysis_dashboard.png"))
 
-    for otr_name, otr_file, field, label, cmap in [
-        ("local_otr", "local_otr_xz", OTR_field, "Local OTR [mol/(m³·s)]", "Blues"),
-        ("kla", "kla_xz", kLa_final, "k_L a [1/s]", "GnBu"),
-        ("o2_driving_force", "o2_driving_force_xz", O2_driving_force, "C* − C_O₂ [mol/m³]", "YlOrRd"),
-        ("our", "our_xz", OUR_field, "OUR [mol/(m³·s)]", "OrRd"),
-    ]:
-        fig_o, ax_o = plt.subplots(figsize=(7, 5))
-        plot_scalar_map(ax_o, masked_field(field)[:, j_mid, :], extent_xz, label, label, cmap)
-        ax_o.set_xlabel("Radial position x [m]")
-        ax_o.set_ylabel("Axial position z [m]")
-        save_figure(fig_o, os.path.join("otr", f"{otr_file}.png"))
+    if export_otr_individual_pngs:
+        for otr_name, otr_file, field, label, cmap in [
+            ("local_otr", "local_otr_xz", OTR_field, "Local OTR [mol/(m³·s)]", "Blues"),
+            ("kla", "kla_xz", kLa_final, "k_L a [1/s]", "GnBu"),
+            ("o2_driving_force", "o2_driving_force_xz", O2_driving_force, "C* − C_O₂ [mol/m³]", "YlOrRd"),
+            ("our", "our_xz", OUR_field, "OUR [mol/(m³·s)]", "OrRd"),
+        ]:
+            fig_o, ax_o = plt.subplots(figsize=(7, 5))
+            plot_scalar_map(ax_o, masked_field(field)[:, j_mid, :], extent_xz, label, label, cmap)
+            ax_o.set_xlabel("Radial position x [m]")
+            ax_o.set_ylabel("Axial position z [m]")
+            save_figure(fig_o, os.path.join("otr", f"{otr_file}.png"))
 
-    fig_otr_z, ax_otr_z = plt.subplots(figsize=(7, 4.5))
-    ax_otr_z.plot(z_coords, OTR_vol_vs_z, color="tab:blue", linewidth=2)
-    ax_otr_z.set_xlabel("Axial position z [m]")
-    ax_otr_z.set_ylabel("Slab-integrated OTR [mol/s]")
-    ax_otr_z.set_title("OTR distribution along reactor height")
-    save_figure(fig_otr_z, os.path.join("otr", "otr_axial_integral.png"))
+        fig_otr_z, ax_otr_z = plt.subplots(figsize=(7, 4.5))
+        ax_otr_z.plot(z_coords, OTR_vol_vs_z, color="tab:blue", linewidth=2)
+        ax_otr_z.set_xlabel("Axial position z [m]")
+        ax_otr_z.set_ylabel("Slab-integrated OTR [mol/s]")
+        ax_otr_z.set_title("OTR distribution along reactor height")
+        save_figure(fig_otr_z, os.path.join("otr", "otr_axial_integral.png"))
 
     # --- Individual time-series PNG per tracked parameter ---
-    for slug, hist_key, ylabel, color, show_max in TIMESERIES_CATALOG:
-        fig_t, ax_t = plt.subplots(figsize=(7, 4.5))
-        ax_t.plot(history["time"], history[hist_key], color=color, linewidth=2, label="Volume average")
-        if show_max:
-            max_key = hist_key.replace("_avg", "_max")
-            if max_key in history:
-                ax_t.plot(history["time"], history[max_key], color=color, linestyle="--", linewidth=1.5, label="Spatial maximum")
-        ax_t.set_xlabel(TIME_LABEL)
-        ax_t.set_ylabel(ylabel)
-        ax_t.set_title(f"Transient response — {ylabel.split('[')[0].strip()}")
-        if show_max:
-            ax_t.legend(frameon=False)
-        save_figure(fig_t, os.path.join("timeseries", f"{slug}_vs_time.png"))
+    if export_individual_timeseries_pngs:
+        for slug, hist_key, ylabel, color, show_max in TIMESERIES_CATALOG:
+            fig_t, ax_t = plt.subplots(figsize=(7, 4.5))
+            ax_t.plot(history["time"], history[hist_key], color=color, linewidth=2, label="Volume average")
+            if show_max:
+                max_key = hist_key.replace("_avg", "_max")
+                if max_key in history:
+                    ax_t.plot(history["time"], history[max_key], color=color, linestyle="--", linewidth=1.5, label="Spatial maximum")
+            ax_t.set_xlabel(TIME_LABEL)
+            ax_t.set_ylabel(ylabel)
+            ax_t.set_title(f"Transient response — {ylabel.split('[')[0].strip()}")
+            if show_max:
+                ax_t.legend(frameon=False)
+            save_figure(fig_t, os.path.join("timeseries", f"{slug}_vs_time.png"))
 
     # --- Combined dashboards (overview figures) ---
     fig_maps, axes_maps = plt.subplots(2, 3, figsize=(15, 8.5))
@@ -1808,14 +1892,27 @@ with open(summary_path, "w", encoding="utf-8") as summary_file:
     summary_file.write(f"  otr/          — OTR-specific analysis PNGs\n")
 
 print(f"\nAll outputs saved to: {os.path.abspath(OUTPUT_DIR)}")
-print(f"  fields/       — {len(SCALAR_CATALOG)} parameters x (3-slice + contour PNGs)")
-print(f"  profiles/     — axial & radial profile sets")
-print(f"  timeseries/   — {len(TIMESERIES_CATALOG)} transient PNGs")
-print(f"  otr/          — OTR / kLa / driving-force / OUR analysis")
-print(f"  spatial_fields_xz_midplane.png, transient_timeseries.png")
-print(f"  final_fields.npz, simulation_summary.txt")
+if export_individual_field_pngs:
+    print(f"  fields/       — {len(SCALAR_CATALOG)} parameters x (3-slice + contour PNGs)")
+else:
+    print("  fields/       — skipped (FAST mode; dashboards only)")
+if export_individual_profile_pngs or export_radial_profiles:
+    print("  profiles/     — axial & radial profile sets")
+else:
+    print("  profiles/     — combined axial dashboard only")
+if export_individual_timeseries_pngs:
+    print(f"  timeseries/   — {len(TIMESERIES_CATALOG)} transient PNGs")
+else:
+    print("  timeseries/   — combined dashboard only")
+if export_otr_individual_pngs:
+    print("  otr/          — OTR / kLa / driving-force / OUR analysis")
+else:
+    print("  otr/          — OTR dashboard only")
+print("  spatial_fields_xz_midplane.png, transient_timeseries.png")
+print("  final_fields.npz, simulation_summary.txt")
 
-plt.show()
+if show_plots:
+    plt.show()
 
 
 

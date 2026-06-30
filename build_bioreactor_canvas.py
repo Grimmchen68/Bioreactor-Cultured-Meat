@@ -2,6 +2,7 @@
 """Build Cursor Canvas with embedded bioreactor simulation data."""
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,8 @@ OUT = Path(
     r"\canvases\bioreactor-3d-explorer.canvas.tsx"
 )
 
-FIELD_META = [
+# Core fields only — keeps canvas JSON small and load fast
+FIELD_META_FULL = [
     ("C_O2", "Dissolved O2", "mol/m3"),
     ("X_bio", "Biomass X", "g/L"),
     ("C_sub", "Substrate S", "g/L"),
@@ -26,33 +28,55 @@ FIELD_META = [
     ("rho", "Density", "kg/m3"),
 ]
 
+FIELD_META_FAST = FIELD_META_FULL[:5]
+
+FAST = os.environ.get("BIOREACTOR_FULL", "0") != "1"
+MAX_VOXELS = 500 if FAST else 1200
+STRIDE = 3 if FAST else 2
+VALUE_DECIMALS = 4
+
+
+def _pick_stride(mask: np.ndarray, stride: int, max_voxels: int) -> int:
+    """Increase stride until voxel count stays under max_voxels."""
+    while stride <= 8:
+        count = int(np.sum(mask[::stride, ::stride, ::stride]))
+        if count <= max_voxels:
+            return stride
+        stride += 1
+    return stride
+
 
 def main() -> None:
+    if not NPZ.is_file():
+        raise SystemExit(f"Missing {NPZ} — run Bioreactor_OTR_model_compressible.py first.")
+
     data = np.load(NPZ)
     x, y, z = data["x"], data["y"], data["z"]
     mask = data["mask"]
-    stride = 2
+    field_meta = FIELD_META_FAST if FAST else FIELD_META_FULL
+    stride = _pick_stride(mask, STRIDE, MAX_VOXELS)
 
     voxels: list[list[float]] = []
-    field_values: dict[str, list[float]] = {k: [] for k, _, _ in FIELD_META}
+    field_values: dict[str, list[float]] = {k: [] for k, _, _ in field_meta}
 
     for i in range(0, mask.shape[0], stride):
         for j in range(0, mask.shape[1], stride):
             for k in range(0, mask.shape[2], stride):
                 if not mask[i, j, k]:
                     continue
-                voxels.append([float(x[i]), float(y[j]), float(z[k])])
-                for key, _, _ in FIELD_META:
-                    field_values[key].append(float(data[key][i, j, k]))
+                voxels.append([round(float(x[i]), 3), round(float(y[j]), 3), round(float(z[k]), 3)])
+                for key, _, _ in field_meta:
+                    field_values[key].append(round(float(data[key][i, j, k]), VALUE_DECIMALS))
 
+    z_stride = 2 if FAST else 1
     z_profile = []
-    for k in range(mask.shape[2]):
+    for k in range(0, mask.shape[2], z_stride):
         layer = mask[:, :, k]
         if not layer.any():
             continue
-        entry = {"z": float(z[k])}
-        for key, _, _ in FIELD_META:
-            entry[key] = float(np.mean(data[key][:, :, k][layer]))
+        entry = {"z": round(float(z[k]), 3)}
+        for key, _, _ in field_meta:
+            entry[key] = round(float(np.mean(data[key][:, :, k][layer])), VALUE_DECIMALS)
         z_profile.append(entry)
 
     payload = {
@@ -65,7 +89,7 @@ def main() -> None:
             "liquidFill": 0.8,
             "impellerZ": [0.30 * 4.026, 0.50 * 4.026, 0.65 * 4.026],
         },
-        "fieldMeta": [{"key": k, "label": l, "unit": u} for k, l, u in FIELD_META],
+        "fieldMeta": [{"key": k, "label": l, "unit": u} for k, l, u in field_meta],
     }
 
     voxels_json = json.dumps(voxels, separators=(",", ":"))
@@ -82,7 +106,8 @@ def main() -> None:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(canvas, encoding="utf-8")
-    print(f"Wrote {OUT} ({len(voxels)} voxels)")
+    size_kb = OUT.stat().st_size / 1024
+    print(f"Wrote {OUT} ({len(voxels)} voxels, stride={stride}, {size_kb:.0f} KB)")
 
 
 CANVAS_TEMPLATE = r'''import { useCallback, useMemo, useRef } from "react";
@@ -175,13 +200,16 @@ export default function Bioreactor3DExplorer() {
     const R = GEOM.diameter / 2;
     const cx = 360;
     const cy = 280;
-    const projected = VOXELS.map(([x, y, z], i) => {
-      const [sx, sy, depth] = project(x, y, z, rotX, rotY, zoom / R, cx, cy);
+    const scale = zoom / R;
+    const out: { sx: number; sy: number; depth: number; color: string; z: number }[] = [];
+    for (let i = 0; i < VOXELS.length; i++) {
+      const [x, y, z] = VOXELS[i];
+      const [sx, sy, depth] = project(x, y, z, rotX, rotY, scale, cx, cy);
       const t = (values[i] - stats.min) / range;
-      return { sx, sy, depth, color: plasma(t), z };
-    });
-    projected.sort((a, b) => a.depth - b.depth);
-    return projected;
+      out.push({ sx, sy, depth, color: plasma(t), z });
+    }
+    out.sort((a, b) => a.depth - b.depth);
+    return out;
   }, [rotX, rotY, zoom, values, stats]);
 
   const sliceCells = useMemo(() => {
@@ -189,11 +217,12 @@ export default function Bioreactor3DExplorer() {
     const tol = GEOM.diameter / 24;
     const range = stats.max - stats.min || 1;
     const cells: { x: number; z: number; t: number }[] = [];
-    VOXELS.forEach(([x, , z], i) => {
+    for (let i = 0; i < VOXELS.length; i++) {
+      const [x, , z] = VOXELS[i];
       if (Math.abs(x) < 1e-6 || Math.abs(VOXELS[i][1] - midY) < tol) {
         cells.push({ x, z, t: (values[i] - stats.min) / range });
       }
-    });
+    }
     return cells;
   }, [values, stats]);
 
@@ -241,7 +270,7 @@ export default function Bioreactor3DExplorer() {
     const scale = zoom / tankR;
     const rings: { z: number; pts: string }[] = [0, tankH * GEOM.liquidFill, tankH].map((z) => {
       const seg: string[] = [];
-      for (let a = 0; a <= 360; a += 12) {
+      for (let a = 0; a <= 360; a += 24) {
         const rad = (a * Math.PI) / 180;
         const [sx, sy] = project(tankR * Math.cos(rad), tankR * Math.sin(rad), z, rotX, rotY, scale, cx, cy);
         seg.push(`${a === 0 ? "M" : "L"}${sx.toFixed(1)},${sy.toFixed(1)}`);
@@ -287,7 +316,7 @@ export default function Bioreactor3DExplorer() {
                 <Button onClick={() => { setRotX(-0.45); setRotY(0.65); setZoom(95); }}>Reset view</Button>
               </Row>
               <Text style={{ color: theme.text.tertiary, fontSize: 12 }}>
-                V ≈ 20 m3 · T = {GEOM.diameter} m · H = {GEOM.height} m · 3 Rushton impellers
+                V ≈ 20 m3 · T = {GEOM.diameter} m · H = {GEOM.height} m · 3 Rushton impellers · {VOXELS.length} voxels
               </Text>
             </Stack>
           </CardBody>
@@ -314,17 +343,16 @@ export default function Bioreactor3DExplorer() {
               {wire.impellers.map((imp, i) => (
                 <g key={i}>
                   <circle cx={imp.sx} cy={imp.sy} r={imp.r} fill="none" stroke={theme.text.secondary} strokeWidth={1.5} />
-                  <line x1={wire.cx} y1={wire.cy - tankH * 0.5 * (zoom / tankR) * 0.01} x2={imp.sx} y2={imp.sy} stroke={theme.stroke.tertiary} strokeWidth={1} />
                 </g>
               ))}
               {viewMode === "voxel"
                 ? points.map((p, i) => (
-                    <rect key={i} x={p.sx - 3.5} y={p.sy - 3.5} width={7} height={7} fill={p.color} opacity={0.85} />
+                    <circle key={i} cx={p.sx} cy={p.sy} r={3} fill={p.color} opacity={0.85} />
                   ))
                 : sliceCells.map((c, i) => {
                     const sx = 360 + c.x * (zoom / tankR);
                     const sy = 280 - c.z * (zoom / tankR);
-                    return <rect key={i} x={sx - 4} y={sy - 4} width={8} height={8} fill={plasma(c.t)} opacity={0.9} />;
+                    return <circle key={i} cx={sx} cy={sy} r={3.5} fill={plasma(c.t)} opacity={0.9} />;
                   })}
               <text x={16} y={24} fill={theme.text.secondary} fontSize={11}>
                 {meta.label} [{meta.unit}] · min {stats.min.toExponential(2)} · max {stats.max.toExponential(2)}
@@ -366,4 +394,3 @@ export default function Bioreactor3DExplorer() {
 
 if __name__ == "__main__":
     main()
-    
